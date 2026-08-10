@@ -1,0 +1,10 @@
+.git
+.env
+.venv
+**/__pycache__
+**/*.pyc
+airflow/logs
+dbt/kmart_retail/logs
+dbt/kmart_retail/target
+runtime
+

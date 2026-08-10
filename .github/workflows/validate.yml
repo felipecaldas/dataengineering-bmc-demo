@@ -1,0 +1,32 @@
+name: validate-demo
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  local-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate Python, shell, JSON and Compose
+        run: make lint
+
+  controlm-build:
+    needs: local-contracts
+    # This runner must have the Control-M Automation API CLI and a configured
+    # non-production environment. No SaaS credentials are stored in the repo.
+    runs-on: [self-hosted, controlm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile workflow with the development descriptor
+        env:
+          CTM_ENV: ${{ vars.CTM_ENV }}
+        run: >-
+          ctm build
+          controlm/workflows/trade_close_to_replenishment.json
+          controlm/descriptors/dev.json
+          -e "${CTM_ENV:-se-dev}"

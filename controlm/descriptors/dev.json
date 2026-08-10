@@ -1,0 +1,17 @@
+{
+  "DeployDescriptor": [
+    {
+      "Property": "ControlmServer",
+      "Assign": "IN01"
+    },
+    {
+      "Property": "Host",
+      "Assign": "fmo-azureuser"
+    },
+    {
+      "Property": "RunAs",
+      "Assign": "azureuser"
+    }
+  ]
+}
+

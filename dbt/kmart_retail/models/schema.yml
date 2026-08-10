@@ -1,0 +1,78 @@
+version: 2
+
+models:
+  - name: stg_pos_transactions
+    description: POS lines conformed to UTC while retaining the source-local timestamp.
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
+
+  - name: stg_store_eod
+    columns:
+      - name: store_id
+        data_tests: [not_null]
+
+  - name: stg_asn_inbound
+    columns:
+      - name: asn_id
+        data_tests: [not_null]
+
+  - name: stg_product_master
+    columns:
+      - name: product_sku
+        data_tests: [unique, not_null]
+
+  - name: int_daily_sales_by_store_sku
+    columns:
+      - name: units_sold
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: int_stock_on_hand
+    columns:
+      - name: on_hand_units
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: dim_product
+    columns:
+      - name: product_sku
+        data_tests: [unique, not_null]
+
+  - name: fct_stock_position
+    columns:
+      - name: store_sku_key
+        data_tests: [unique, not_null]
+      - name: on_hand_units
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: fct_sell_through
+    columns:
+      - name: avg_daily_units
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: fct_replenishment_need
+    columns:
+      - name: replenishment_units
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 5000
+                inclusive: true
+
+seeds: []
+

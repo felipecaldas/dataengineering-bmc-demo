@@ -1,0 +1,17 @@
+{
+  "DeployDescriptor": [
+    {
+      "Property": "ControlmServer",
+      "Assign": "CTM-PROD"
+    },
+    {
+      "Property": "Host",
+      "Assign": "retail-data-agent-prod"
+    },
+    {
+      "Property": "RunAs",
+      "Assign": "retailbatch"
+    }
+  ]
+}
+

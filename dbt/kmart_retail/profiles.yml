@@ -1,0 +1,14 @@
+kmart_retail:
+  target: demo
+  outputs:
+    demo:
+      type: postgres
+      host: "{{ env_var('DBT_HOST', 'postgres') }}"
+      port: "{{ env_var('DBT_PORT', '5432') | int }}"
+      user: "{{ env_var('DBT_USER', 'retail') }}"
+      password: "{{ env_var('DBT_PASSWORD', 'retail') }}"
+      dbname: "{{ env_var('DBT_DATABASE', 'retail') }}"
+      schema: gold
+      threads: 4
+      connect_timeout: 10
+

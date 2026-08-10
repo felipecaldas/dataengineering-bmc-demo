@@ -1,0 +1,16 @@
+{
+  "name": "kmart-demo-bronze-ingest",
+  "tasks": [
+    {
+      "task_key": "bronze_ingest",
+      "notebook_task": {
+        "notebook_path": "/Shared/kmart-demo/01_bronze_ingest",
+        "base_parameters": {"trading_date": "{{job.parameters.trading_date}}"}
+      },
+      "environment_key": "default"
+    }
+  ],
+  "parameters": [{"name": "trading_date", "default": "2026-08-14"}],
+  "environments": [{"environment_key": "default", "spec": {"client": "1"}}]
+}
+

@@ -1,0 +1,21 @@
+[Unit]
+Description=Control-M SaaS Agent for the Retail DataOps demo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/ctmag/ctm
+Environment="CONTROLM=/home/azureuser/ctmag/ctm"
+Environment="LD_LIBRARY_PATH=/home/azureuser/ctmag/ctm/cm/AFT/exe:/home/azureuser/ctmag/ctm/exe"
+Environment="PATH=/home/azureuser/ctmag/ctm/scripts:/home/azureuser/ctmag/ctm/exe:/home/azureuser/ctmag/ctm/cm/AFT/exe:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/azureuser/ctmag/ctm/scripts/start-ag -u azureuser -p ALL -s
+ExecStop=/home/azureuser/ctmag/ctm/scripts/shut-ag -u azureuser -p ALL
+TimeoutStartSec=120
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

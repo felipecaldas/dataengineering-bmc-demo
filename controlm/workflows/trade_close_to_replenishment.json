@@ -1,0 +1,128 @@
+{
+  "TradeCloseToReplenishment": {
+    "Type": "Folder",
+    "ControlmServer": "IN01",
+    "OrderMethod": "Manual",
+    "Application": "RetailDataOps",
+    "SubApplication": "StoreReplenishment",
+    "Description": "Trade day close to WMS acknowledgement with a 06:00 pick-wave SLA",
+    "Variables": [
+      {
+        "DEMO_DATE": "%%ODATE"
+      }
+    ],
+    "WaitAllStoresEOD": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh gate-eod %%DEMO_DATE",
+      "Description": "Apply the 99.5/98.0 store-completeness policy to Kafka EOD events"
+    },
+    "WaitSupplierASN": {
+      "Type": "Job:FileWatcher:Create",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Path": "/home/azureuser/retail-data-demo/runtime/asn/ASN_%%DEMO_DATE.csv",
+      "SearchInterval": "5",
+      "TimeLimit": "90",
+      "MinimumSize": "10B",
+      "Description": "Supplier ASN non-arrival is visible as a distinct upstream failure"
+    },
+    "BronzeIngest": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh bronze %%DEMO_DATE"
+    },
+    "SilverConform": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh silver %%DEMO_DATE"
+    },
+    "DbtGold": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh dbt %%DEMO_DATE",
+      "Description": "Runs dbt build initially and dbt retry from the prior quality-gate failure on Control-M rerun",
+      "RerunLimit": {
+        "Every": "1",
+        "Units": "Minutes",
+        "Times": "2"
+      },
+      "ActionIfFailure": {
+        "Type": "If",
+        "CompletionStatus": "NOTOK",
+        "RetryFromPointOfFailure": {
+          "Type": "Action:Rerun"
+        }
+      }
+    },
+    "ReplenishmentCalc": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh replen %%DEMO_DATE"
+    },
+    "DeliverToWMS": {
+      "Type": "Job:Command",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh deliver %%DEMO_DATE",
+      "Description": "Idempotent delivery to the WMS SFTP endpoint"
+    },
+    "ConfirmWMSIntake": {
+      "Type": "Job:FileWatcher:Create",
+      "Host": "fmo-azureuser",
+      "RunAs": "azureuser",
+      "Path": "/home/azureuser/retail-data-demo/runtime/wms/ack/REPLEN_ACK_%%DEMO_DATE.txt",
+      "SearchInterval": "5",
+      "TimeLimit": "20",
+      "MinimumSize": "10B",
+      "Description": "The service ends only after WMS acknowledges the order"
+    },
+    "SLA_PickWave": {
+      "Type": "Job:SLAManagement",
+      "Host": "fmo-azureuser",
+      "ServiceName": "Store Replenishment",
+      "ServicePriority": "1",
+      "RunAs": "azureuser",
+      "JobRunsDeviationsTolerance": "2",
+      "CompleteBy": {
+        "Time": "06:00",
+        "Days": "0"
+      },
+      "ServiceActions": {
+        "ForecastLate": {
+          "Type": "If:SLA:ServiceIsLate",
+          "NotifyOps": {
+            "Type": "Action:SLA:Notify",
+            "Severity": "VeryUrgent",
+            "Message": "%%SERVICE_NAME forecast late. Due %%SERVICE_DUE_TIME; expected %%SERVICE_EXPECTED_END_TIME; problematic %%PROBLEMATIC_JOBS"
+          }
+        }
+      }
+    },
+    "EodToBronze": {
+      "Type": "Flow",
+      "Sequence": ["WaitAllStoresEOD", "BronzeIngest"]
+    },
+    "AsnToBronze": {
+      "Type": "Flow",
+      "Sequence": ["WaitSupplierASN", "BronzeIngest"]
+    },
+    "ProcessingFlow": {
+      "Type": "Flow",
+      "Sequence": [
+        "BronzeIngest",
+        "SilverConform",
+        "DbtGold",
+        "ReplenishmentCalc",
+        "DeliverToWMS",
+        "ConfirmWMSIntake",
+        "SLA_PickWave"
+      ]
+    }
+  }
+}

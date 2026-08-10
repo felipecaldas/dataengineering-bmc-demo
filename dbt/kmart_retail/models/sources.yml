@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: silver
+    schema: silver
+    tables:
+      - name: pos_transactions
+      - name: store_eod
+      - name: asn_inbound
+      - name: product_master
+      - name: stock_on_hand
+      - name: sales_history
+

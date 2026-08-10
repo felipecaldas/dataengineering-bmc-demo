@@ -1,0 +1,280 @@
+name: ${COMPOSE_PROJECT_NAME:-retail-data-demo}
+
+x-demo-environment: &demo-environment
+  DATABASE_URL: postgresql://${POSTGRES_USER:-retail}:${POSTGRES_PASSWORD:-retail}@postgres:5432/${POSTGRES_DB:-retail}
+  KAFKA_BOOTSTRAP: redpanda:9092
+  AZURE_STORAGE_CONTAINER: kmart-demo
+  AZURE_STORAGE_CONNECTION_STRING: >-
+    DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+  DEMO_TRADING_DATE: ${DEMO_TRADING_DATE:-2026-08-14}
+  STORE_COUNT: ${STORE_COUNT:-325}
+  SKU_COUNT: ${SKU_COUNT:-2000}
+  TXN_PER_STORE: ${TXN_PER_STORE:-200}
+  DEMO_SEED: ${DEMO_SEED:-20260814}
+  WMS_HOST: wms-sftp
+  WMS_PORT: "22"
+  WMS_USER: ${WMS_USER:-demo}
+  WMS_PASSWORD: ${WMS_PASSWORD:-demo}
+
+x-toolbox: &toolbox
+  image: retail-demo/toolbox:1.0
+  environment: *demo-environment
+  working_dir: /workspace
+  volumes:
+    - ./:/workspace
+    - wms-data:/wms
+  networks: [demo]
+
+x-airflow-environment: &airflow-environment
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__PARALLELISM: "8"
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "8"
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-retail-demo-jwt-signing-key-2026-control-plane-a-0123456789-abcdefghij}
+  AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:-retail-demo-log-signing-key-2026-control-plane-a-9876543210-jihgfedcba}
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-retail}:${POSTGRES_PASSWORD:-retail}@postgres:5432/airflow
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/config/simple_auth_manager_passwords.json.generated
+  AIRFLOW__API__BASE_URL: http://localhost:8080
+  AIRFLOW__COSMOS__ENABLE_DATASET_ALIAS: "true"
+  AIRFLOW__COSMOS__USE_DATASET_AIRFLOW3_URI_STANDARD: "true"
+  AIRFLOW_CONN_DATABRICKS_DEFAULT: '{"conn_type":"databricks","host":"databricks-local","schema":"http","port":8000,"password":"demo-token","extra":{"token":"demo-token","retry_limit":3,"retry_delay":1}}'
+  AIRFLOW_CONN_RETAIL_POSTGRES: postgresql://${POSTGRES_USER:-retail}:${POSTGRES_PASSWORD:-retail}@postgres:5432/${POSTGRES_DB:-retail}
+  DBT_PROFILES_DIR: /opt/airflow/dbt
+  DEMO_AIRFLOW_SCHEDULE: ${DEMO_AIRFLOW_SCHEDULE:-}
+  PYTHONPATH: /opt/airflow:/opt/airflow/dags
+  <<: *demo-environment
+
+x-airflow-common: &airflow-common
+  image: retail-demo/airflow:3.3.0
+  environment: *airflow-environment
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./dbt/kmart_retail:/opt/airflow/dbt/kmart_retail
+    - ./demo:/opt/airflow/demo
+    - ./runtime:/opt/airflow/runtime
+  networks: [demo]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    databricks-local:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-retail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-retail}
+      POSTGRES_DB: ${POSTGRES_DB:-retail}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [demo]
+
+  redpanda:
+    image: redpandadata/redpanda:v25.2.10
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=768M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://${KAFKA_ADVERTISED_HOST:-localhost}:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: [CMD-SHELL, "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [demo]
+
+  redpanda-console:
+    image: redpandadata/console:v3.2.2
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks: [demo]
+
+  kafka-init:
+    image: redpandadata/redpanda:v25.2.10
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        rpk topic create pos.transactions.v1 --brokers redpanda:9092 --partitions 6 || true
+        rpk topic create pos.store-eod.v1 --brokers redpanda:9092 --partitions 3 || true
+        rpk topic list --brokers redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks: [demo]
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    command: azurite-blob --blobHost 0.0.0.0 --loose --location /data
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: [CMD, node, -e, "require('net').connect(10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [demo]
+
+  blob-init:
+    <<: *toolbox
+    build:
+      context: .
+      dockerfile: infra/toolbox/Dockerfile
+    command: [python, -m, demo.cli, init-blob]
+    depends_on:
+      azurite:
+        condition: service_healthy
+
+  kafka-ingest:
+    <<: *toolbox
+    command: [python, -m, demo.kafka_ingest]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  databricks-local:
+    <<: *toolbox
+    command: [uvicorn, demo.databricks_api:app, --host, 0.0.0.0, --port, "8000"]
+    ports:
+      - "8090:8000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+      blob-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  wms-sftp:
+    image: atmoz/sftp:alpine
+    command: ${WMS_USER:-demo}:${WMS_PASSWORD:-demo}:1001::inbound/replen,ack,reject
+    ports:
+      - "2222:22"
+    volumes:
+      - wms-data:/home/${WMS_USER:-demo}
+    healthcheck:
+      test: [CMD-SHELL, "ps | grep -q '[s]shd'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [demo]
+
+  wms-ack-writer:
+    <<: *toolbox
+    command: [python, -m, demo.wms_ack]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      wms-sftp:
+        condition: service_healthy
+
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: .
+      dockerfile: infra/airflow/Dockerfile
+    entrypoint: /bin/bash
+    command:
+      - -ec
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/config
+        airflow db migrate
+    restart: "no"
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8080/api/v2/monitor/health]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  toolbox:
+    <<: *toolbox
+    profiles: [tools]
+    command: [python, -m, demo.cli, --help]
+
+volumes:
+  postgres-data:
+  redpanda-data:
+  azurite-data:
+  wms-data:
+
+networks:
+  demo:
+    name: retail-data-demo

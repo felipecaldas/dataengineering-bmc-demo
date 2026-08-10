@@ -1,0 +1,23 @@
+name: kmart_retail
+version: 1.0.0
+config-version: 2
+profile: kmart_retail
+
+model-paths: [models]
+test-paths: [tests]
+macro-paths: [macros]
+seed-paths: [seeds]
+clean-targets: [target, dbt_packages]
+
+models:
+  kmart_retail:
+    +materialized: view
+    staging:
+      +schema: staging
+    intermediate:
+      +schema: intermediate
+      +materialized: table
+    marts:
+      +schema: gold
+      +materialized: table
+
