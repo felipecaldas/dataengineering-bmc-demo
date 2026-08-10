@@ -8,5 +8,4 @@ select
   eod_ts_local,
   eod_ts_utc
 from {{ source('silver', 'store_eod') }}
-where trading_date = '{{ var("trading_date") }}'::date
-
+where trading_date = cast('{{ var("trading_date") }}' as date)

@@ -7,5 +7,4 @@ select
   stock.on_order_units,
   stock.snapshot_date
 from {{ source('silver', 'stock_on_hand') }} stock
-where stock.snapshot_date = '{{ var("trading_date") }}'::date
-
+where stock.snapshot_date = cast('{{ var("trading_date") }}' as date)
