@@ -1,4 +1,5 @@
 .env
+dbt_cloud.yml
 .venv/
 __pycache__/
 *.py[cod]

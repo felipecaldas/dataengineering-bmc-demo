@@ -6,8 +6,8 @@ independent control planes:
 
 - **Control plane A:** Apache Airflow 3.3 with Cosmos 1.15, showing ten dbt nodes.
 - **Control plane B:** the host's enrolled Control-M SaaS Agent 9.0.22, with a
-  workflow-as-code definition, native file watches, downstream acknowledgement,
-  and an SLA Management job.
+  workflow-as-code definition, a Kubernetes Event Handler consuming Kafka,
+  native file watches, downstream acknowledgement, and an SLA Management job.
 
 The business premise is deliberately labelled as an industry-informed assumption,
 not as Kmart's actual process. Confirm overnight versus intraday replenishment,
@@ -16,9 +16,10 @@ customer before presenting.
 
 ## What is self-contained
 
-`docker-compose.yml` is the master file. It starts Redpanda (Kafka API), Azurite
-(Azure Blob API), Postgres, a Databricks Jobs API-compatible local stage runner,
-an SFTP WMS and acknowledgement writer, the data generators, and Airflow.
+`docker-compose.yml` is the master file. It starts Redpanda (Kafka API), the
+Kafka-native EOD readiness projector, Azurite (Azure Blob API), Postgres, a
+Databricks Jobs API-compatible local stage runner, an SFTP WMS and
+acknowledgement writer, the data generators, and Airflow.
 
 The Control-M Agent is the only deliberate host component. Its SaaS enrollment and
 identity already belong to this machine and must not be copied into an image. Every
@@ -31,17 +32,21 @@ Airflow.
 
 The local Databricks service preserves the Jobs API job/run interaction used by the
 Airflow provider, but it is not Apache Spark or Delta Lake and must not be presented
-as a performance simulation of Azure Databricks. The checked-in Databricks notebook
-and job definitions are the adapter for a later real-Azure profile. No Azure
-workspace details were supplied or discovered, and no connection, credential or
-token was read from or copied out of the host Airflow installation.
+as a performance simulation of Azure Databricks. The optional real-Azure adapter is
+separate: host-side scripts provision an auto-terminating cluster, export a validated
+date from local silver, and replace the matching Delta windows. Workspace details,
+generated IDs and OAuth state remain outside source under the user's CLI profile and
+ignored `runtime/`; the default Compose profile never contacts Azure.
 
 This is an explicit implementation change from the original `demo_design.md`,
 which specified external Azure Databricks. It follows the later requirement that
 the runnable demo be self-contained under one Compose file. Connecting a real
 workspace remains possible as a separate profile, but requires an Azure workspace
-host, authentication method, job IDs 440/441/447 (or replacements), and any Blob,
-catalog and SQL-warehouse details. Those values are currently empty.
+host and authentication method. On the currently exercised Standard-tier workspace,
+the adapter uses a dedicated single-node cluster and the legacy Hive Metastore; it
+does not claim Unity Catalog or SQL Warehouse support. See `docs/OPERATIONS.md` for
+the explicit, billable provisioning and synchronization commands. Jobs 440/441/447
+remain the logical IDs of the default local control-plane contract.
 
 ## Airflow version decision
 
@@ -149,19 +154,44 @@ make controlm-deploy
 make run-controlm DATE=2026-08-14
 ```
 
-The self-contained version uses `Job:Command` for the local Databricks API and dbt
-Core. This is technically important: Control-M's current `Job:DBT` integration is
-for a pre-existing dbt platform job, not a generic local dbt Core invocation. Native
-`Job:Databricks` is appropriate when the optional Azure connection profile is
-configured. Native File Watcher and SLA Management remain first-class jobs here.
-The dbt command wrapper records a date-scoped failure marker, so a Control-M rerun
-uses `dbt retry`; a successful run clears the marker.
+`WaitForStoreEODThreshold` is a `Job:Dummy` that waits for the date-scoped
+`RETAIL_EOD_READY_%%DEMO_DATE` event. A Python projector counts unique EOD markers
+and publishes one readiness message at the 98.0% policy boundary. Its private
+compacted Kafka state topic and the public action topic are updated in one Kafka
+transaction, so this path adds no Postgres dependency. The BMC Event Handler in
+`/home/azureuser/controlm-event-driven` maps only the committed public message to
+`setevent`; it does not contain the threshold policy.
 
-The current `se-dev` API token is authenticated and authorised for configuration
-reads and workflow compilation. `ctm build` validates one SMART folder, all nine
-jobs, and the development deploy descriptor. The Agent is enrolled, running, and
-has a successful server ping; the same stage chain has also been run with all
-Airflow services stopped. No workflow has been deployed by this repository.
+Arm each live or replay demonstration before publishing its EOD markers:
+
+```bash
+make eod-readiness-arm DATE=2026-08-14
+make eod-readiness-status DATE=2026-08-14
+```
+
+The deployed Control-M profile is the optional real-Azure path. It keeps the two
+local input gates and conformance contract, synchronizes the six validated sources
+to Azure Databricks, and then uses three native `Job:DBT` jobs to trigger
+pre-existing dbt Cloud jobs for the tagged Bronze, Silver, and Gold layers. The
+workflow exports tested Azure Gold output to the existing WMS contract and retains
+native File Watcher and SLA Management jobs. `Job:DBT` is a dbt platform
+integration; it is not a generic local dbt Core runner.
+
+Provision and validate that profile explicitly:
+
+```bash
+make dbt-cloud-publish-controlm
+make dbt-cloud-controlm-provision
+make controlm-dbt-trust
+make controlm-dbt-provision
+make controlm-build
+```
+
+`controlm-dbt-trust` idempotently adds the public ISRG Root X1 CA to the host
+Application Integrator trust store; it never disables TLS validation. `ctm build`
+validates one SMART folder, all 12 jobs, and the development descriptor. The local
+dbt Core path remains available through Make and Airflow, but is not substituted
+for the native plug-in in this Control-M profile.
 
 `.github/workflows/validate.yml` runs local contracts on a hosted runner and compiles
 the development descriptor on a `self-hosted, controlm` runner. Set the repository
@@ -201,7 +231,10 @@ orchestrator: `make wms-never-ack`, `make wms-late`, `make wms-reject`, and
 - A normal simulated day publishes 65,000 POS messages and one EOD marker per
   expected trading store.
 - EOD policy: at least 99.5% proceeds; 98.0–99.5% proceeds with a trade-ops alert;
-  below 98.0% holds.
+  below 98.0% holds. For 325 expected stores, 318 holds and the 319th unique marker
+  makes the date eligible. A complete 325-store day emits immediately; an eligible
+  incomplete day emits after a three-second quiet window so the message reflects
+  the final 319/324-style outcome instead of racing the last markers.
 - The ASN schema is validated before silver rows are changed.
 - dbt builds four staging, two intermediate, and four gold models with tests.
 - All stage writes use natural keys or replace the date partition and are safe to

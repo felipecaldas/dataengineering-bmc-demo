@@ -3,6 +3,9 @@ version: 1.0.0
 config-version: 2
 profile: kmart_retail
 
+dbt-cloud:
+  project-id: 70506183158510
+
 model-paths: [models]
 test-paths: [tests]
 macro-paths: [macros]
@@ -14,10 +17,12 @@ models:
     +materialized: view
     staging:
       +schema: staging
+      +tags: [bronze]
     intermediate:
       +schema: intermediate
       +materialized: table
+      +tags: [silver]
     marts:
       +schema: gold
       +materialized: table
-
+      +tags: [gold]

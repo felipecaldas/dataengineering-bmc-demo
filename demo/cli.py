@@ -13,6 +13,8 @@ from confluent_kafka.admin import AdminClient
 
 from demo import blob
 from demo.config import settings
+from demo.databricks_export import export_silver
+from demo.databricks_order import import_databricks_order
 from demo.db import connect, set_config
 from demo.failures import late_stores, no_asn, phantom_stock, reset, schema_drift, slow_cluster
 from demo.gates import ack_name, asn_ready, eod_status
@@ -172,6 +174,12 @@ def main() -> None:
     dbx.add_argument("job_id", type=int, choices=[440, 441, 447])
     add_date(dbx)
 
+    azure_export = sub.add_parser("export-databricks-silver")
+    add_date(azure_export)
+
+    azure_order = sub.add_parser("import-databricks-order")
+    add_date(azure_order)
+
     for name in ("gate-eod", "gate-asn", "gate-ack"):
         gate = sub.add_parser(name)
         add_date(gate)
@@ -231,6 +239,10 @@ def main() -> None:
         emit(deliver_to_wms(parsed_date(args.date)))
     elif args.command == "databricks-run":
         cmd_databricks_run(args)
+    elif args.command == "export-databricks-silver":
+        emit(export_silver(parsed_date(args.date)))
+    elif args.command == "import-databricks-order":
+        emit(import_databricks_order(parsed_date(args.date)))
     elif args.command == "gate-eod":
         cmd_gate_eod(args)
     elif args.command == "gate-asn":

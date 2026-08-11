@@ -127,6 +127,9 @@ services:
       - |
         rpk topic create pos.transactions.v1 --brokers redpanda:9092 --partitions 6 || true
         rpk topic create pos.store-eod.v1 --brokers redpanda:9092 --partitions 3 || true
+        rpk topic create retail.store-eod-readiness-command.v1 --brokers redpanda:9092 --partitions 1 --topic-config cleanup.policy=compact || true
+        rpk topic create retail.store-eod-readiness-state.v1 --brokers redpanda:9092 --partitions 1 --topic-config cleanup.policy=compact || true
+        rpk topic create retail.store-eod-readiness.v1 --brokers redpanda:9092 --partitions 1 || true
         rpk topic list --brokers redpanda:9092
     depends_on:
       redpanda:
@@ -164,6 +167,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  eod-readiness:
+    <<: *toolbox
+    command: [python, -m, demo.eod_readiness, run]
+    restart: unless-stopped
+    depends_on:
       redpanda:
         condition: service_healthy
       kafka-init:

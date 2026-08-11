@@ -12,5 +12,4 @@ select
   transaction_ts_local,
   transaction_ts_utc
 from {{ source('silver', 'pos_transactions') }}
-where trading_date = '{{ var("trading_date") }}'::date
-
+where trading_date = cast('{{ var("trading_date") }}' as date)

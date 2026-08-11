@@ -4,6 +4,7 @@ set -euo pipefail
 DEMO_ROOT=/home/azureuser/retail-data-demo
 STAGE=${1:?stage is required}
 RAW_DATE=${2:-20260814}
+export PATH="/home/azureuser/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 if [[ "$RAW_DATE" =~ ^[0-9]{8}$ ]]; then
   TRADING_DATE="${RAW_DATE:0:4}-${RAW_DATE:4:2}-${RAW_DATE:6:2}"
@@ -37,6 +38,11 @@ case "$STAGE" in
   silver)
     run_compose run --rm toolbox python -m demo.cli databricks-run 441 --date "$TRADING_DATE"
     ;;
+  azure-sync)
+    python3 databricks/provision_cluster.py
+    run_compose run --rm toolbox python -m demo.cli export-databricks-silver --date "$TRADING_DATE"
+    python3 databricks/sync_silver.py --date "$TRADING_DATE"
+    ;;
   dbt)
     retry_marker="runtime/.dbt-retry-${TRADING_DATE//-/}"
     dbt_command=build
@@ -51,6 +57,10 @@ case "$STAGE" in
     ;;
   replen)
     run_compose run --rm toolbox python -m demo.cli databricks-run 447 --date "$TRADING_DATE"
+    ;;
+  azure-replen)
+    python3 databricks/export_replenishment.py --date "$TRADING_DATE"
+    run_compose run --rm toolbox python -m demo.cli import-databricks-order --date "$TRADING_DATE"
     ;;
   deliver)
     run_compose run --rm toolbox python -m demo.cli deliver --date "$TRADING_DATE"

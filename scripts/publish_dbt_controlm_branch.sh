@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEMO_ROOT=/home/azureuser/retail-data-demo
+BRANCH=${DBT_CLOUD_CONTROL_M_BRANCH:-demo/dbt-cloud-controlm}
+
+cd "$DEMO_ROOT"
+git fetch --quiet origin
+
+base_ref=origin/main
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+  base_ref="origin/$BRANCH"
+fi
+
+worktree=$(mktemp -d)
+cleanup() {
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+git worktree add --quiet --detach "$worktree" "$base_ref"
+rsync -a --delete \
+  --exclude .user.yml \
+  --exclude profiles.yml \
+  --exclude logs/ \
+  --exclude target/ \
+  "$DEMO_ROOT/dbt/kmart_retail/" "$worktree/dbt/kmart_retail/"
+
+git -C "$worktree" add dbt/kmart_retail
+if ! git -C "$worktree" diff --cached --quiet; then
+  git -C "$worktree" \
+    -c user.name="Retail Data Demo" \
+    -c user.email="retail-data-demo@localhost" \
+    commit --quiet -m "Make retail dbt models portable to Databricks"
+fi
+git -C "$worktree" push --quiet origin "HEAD:refs/heads/$BRANCH"
+echo "dbt project published to origin/$BRANCH"

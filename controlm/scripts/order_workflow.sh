@@ -17,12 +17,14 @@ fi
 
 config_file=$(mktemp)
 trap 'rm -f -- "$config_file"' EXIT
+asn_path="/home/azureuser/retail-data-demo/runtime/asn/ASN_${order_date}.csv"
+ack_path="/home/azureuser/retail-data-demo/runtime/wms/ack/REPLEN_ACK_${order_date}.txt"
 if [[ "$allow_duplicate" == "true" ]]; then
-  printf '{"waitForOrderDate":false,"createDuplicate":true,"independentFlow":true,"variables":[{"DEMO_DATE":"%s"}]}\n' \
-    "$order_date" >"$config_file"
+  printf '{"waitForOrderDate":false,"createDuplicate":true,"independentFlow":true,"variables":[{"DEMO_DATE":"%s"},{"DEMO_ISO_DATE":"%s"},{"ASN_PATH":"%s"},{"ACK_PATH":"%s"}]}\n' \
+    "$order_date" "$trading_date" "$asn_path" "$ack_path" >"$config_file"
 else
-  printf '{"waitForOrderDate":false,"variables":[{"DEMO_DATE":"%s"}]}\n' \
-    "$order_date" >"$config_file"
+  printf '{"waitForOrderDate":false,"variables":[{"DEMO_DATE":"%s"},{"DEMO_ISO_DATE":"%s"},{"ASN_PATH":"%s"},{"ACK_PATH":"%s"}]}\n' \
+    "$order_date" "$trading_date" "$asn_path" "$ack_path" >"$config_file"
 fi
 
 ctm run order IN01 TradeCloseToReplenishment \

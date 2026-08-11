@@ -1,188 +1,299 @@
-# Presentation runsheet
+# Presentation runsheet — Control-M, dbt Cloud and Azure Databricks
 
-This is the operator sequence for a customer presentation. Use trading date
-`2026-08-14`, an ordinary Friday with all 325 demo stores expected.
+This is the canonical sequence for the **Trade Day Close to Store Replenishment**
+presentation. Use trading date `2026-08-14`, an ordinary Friday with all 325
+fictional demo stores expected.
 
-## One-time Control-M preparation — before presentation day
+The business thresholds, schedule, estate and integration boundaries are demo
+assumptions. Never represent them as Kmart's actual production process.
 
-The repository currently contains a validated workflow, but it has not been
-deployed by this project. A live Control-M run therefore has one explicit external
-prerequisite:
+## What this profile demonstrates
+
+This profile is one end-to-end business service:
+
+1. Compose produces deterministic POS and EOD messages in Redpanda and a supplier
+   ASN in Azurite plus the host-visible File Watcher path.
+2. A Python projector publishes the 98.0% EOD readiness fact to Kafka; the BMC
+   Event Handler creates the matching Control-M event, which converges with the
+   ASN File Watcher.
+3. Local idempotent landing and contract stages prepare the source snapshot. The
+   exact ASN header is validated before the local silver partition can change.
+4. Control-M synchronizes the six validated source tables to real Azure
+   Databricks Delta tables.
+5. Three native Control-M `Job:DBT` jobs trigger pre-existing dbt Cloud jobs:
+   `DbtBronze`, `DbtSilver`, and `DbtGold`.
+6. The tested Databricks gold result is exported as the deterministic WMS CSV,
+   delivered over SFTP, acknowledged, and included in the 06:00 demo SLA.
+
+The three dbt job labels are presentation zones, with this exact mapping:
+
+| Control-M job | dbt selector | Physical dbt resources |
+|---|---|---|
+| `DbtBronze` | `tag:bronze` | Four `staging` views over validated Delta sources |
+| `DbtSilver` | `tag:silver` | Two `intermediate` tables |
+| `DbtGold` | `tag:gold` | Four `gold` marts and their tests |
+
+Do not imply that `DbtBronze` consumes Kafka directly. Kafka landing, the ASN
+contract and the six-table bridge occur before the dbt jobs. The source Delta
+database remains named `silver` because it represents the already-conformed
+handoff contract.
+
+The Azure workspace is Standard-tier. This profile uses a dedicated
+auto-terminating all-purpose cluster and legacy Hive Metastore, not a SQL Warehouse
+or Unity Catalog. The connected dbt tenant rejects `databricks_v0` on Fusion, so
+the deployment environment uses the Core `latest` release track.
+
+## One-time preparation
+
+From the repository root, install/authenticate the Databricks CLI and provision
+the cluster:
 
 ```bash
-cd /home/azureuser/retail-data-demo
+make install-databricks-cli
+databricks auth login \
+  --host https://WORKSPACE.azuredatabricks.net \
+  --profile retail-demo-azure
+make databricks-azure-provision
+```
+
+The root `.env` must contain the dbt Cloud account host, account ID and service
+token, plus a valid Databricks PAT for the deployment credential. These values are
+read at execution time and never written to source or generated state.
+
+Publish only the dbt project to its dedicated deployment branch, then create or
+update the dbt Cloud resources:
+
+```bash
+make dbt-cloud-publish-controlm
+make dbt-cloud-controlm-provision
+```
+
+The provisioner is idempotent by name. It configures:
+
+- project subdirectory `dbt/kmart_retail`;
+- deployment branch `demo/dbt-cloud-controlm`;
+- environment `Azure Databricks Control-M` on Core `latest`;
+- a Databricks deployment credential whose token remains encrypted in dbt Cloud;
+- jobs `Retail Demo Bronze`, `Retail Demo Silver`, and `Retail Demo Gold`.
+
+It records only resource IDs under ignored `runtime/dbt_cloud/azure.json`.
+
+Store the dbt Cloud service token in the centralized Control-M connection profile:
+
+```bash
+make controlm-dbt-trust
+make controlm-dbt-provision
+```
+
+The trust target idempotently imports the public ISRG Root X1 CA into the host
+Application Integrator trust store and retains a backup; it does not disable TLS
+verification. Run it when an older Agent otherwise reports `PKIX path building
+failed` for the dbt Cloud account URL.
+
+The resulting profile is `FMO_AZURE_DBT`. Installed dbt plug-in version 1.0.01
+does not implement Control-M's connection-profile test operation, so the first
+`Job:DBT` execution is the effective connection test. This limitation is not a
+reason to put the service token in the workflow JSON.
+
+The plug-in also embeds overridden commands directly in a JSON request. Keep YAML
+variables single-quoted as rendered by the checked-in workflow; embedded double
+quotes make version 1.0.01 produce invalid JSON.
+
+Render the generated dbt job IDs, validate all 12 jobs, and deploy explicitly:
+
+```bash
 make controlm-build
 make controlm-deploy
 ```
 
-`controlm-deploy` changes the connected `se-dev` tenant. Run it only after the
-tenant owner approves the deployment. Then perform a smoke run and confirm that
-the folder is visible in Control-M Monitoring:
+`controlm-deploy` changes the connected `se-dev` tenant. Do not run it as an
+incidental lint step.
+
+Verify or reconcile the local Event Handler before the rehearsal:
 
 ```bash
-make demo-ready DATE=2026-08-14
-make run-controlm DATE=2026-08-14
+/home/azureuser/controlm-event-driven/scripts/install-handler.sh
+/home/azureuser/controlm-event-driven/scripts/status.sh
 ```
 
-If the SLA forecast is part of the presentation, build the successful-run history
-well in advance and confirm that every ordered run has completed:
-
-```bash
-make seed-sla-history N=15 DATE=2026-08-14
-```
-
-Do not leave deployment, smoke testing or SLA-history generation until the live
-session.
+It must show one ready `retail-event-handler` pod. The token remains in the
+Kubernetes Secret and must never be shown during the presentation.
 
 ## 30–60 minutes before the audience arrives
 
-Start and prepare the whole containerised application:
+Run a complete smoke test:
 
 ```bash
 cd /home/azureuser/retail-data-demo
-make demo-ready DATE=2026-08-14
+make demo-controlm-azure DATE=2026-08-14
+```
+
+That target starts the stack, seeds reference data, arms a fresh EOD generation,
+publishes the dbt deployment branch, provisions dbt Cloud and the Control-M
+profile, builds and deploys the workflow, orders one run, and only then publishes
+the date's POS/EOD events and ASN. Ordering is asynchronous; monitor the folder
+until all 12 jobs end OK.
+
+The first `make demo-ready` immediately after image recreation can briefly report
+Airflow health as `starting`. Wait for the API container to become healthy, then
+continue with `make health`; do not recreate the stack again.
+
+Expected source counts are:
+
+| Source | Rows / replacement window |
+|---|---:|
+| Kafka `pos.transactions.v1` | 65,000 messages for the run |
+| Kafka `pos.store-eod.v1` | 325 markers for the run |
+| Delta `product_master` | 2,000 rows |
+| Delta `pos_transactions` | 65,000 for `2026-08-14` |
+| Delta `store_eod` | 325 for `2026-08-14` |
+| Delta `asn_inbound` | 5,000 for `2026-08-14` |
+| Delta `stock_on_hand` | 26,000 for `2026-08-14` |
+| Delta `sales_history` | 364,000 for the preceding 28 days |
+
+Verify the operator views before screen sharing:
+
+1. Redpanda Console at `http://localhost:8081`.
+2. Azure Databricks Compute and the legacy-Hive `silver`, `staging`,
+   `intermediate`, and `gold` databases.
+3. dbt Cloud deployment environment `Azure Databricks Control-M` and its three
+   latest job runs.
+4. Control-M Monitoring for `TradeCloseToReplenishment`.
+5. The WMS acknowledgement under `runtime/wms/ack/`.
+
+Never display `.env`, `~/.databrickscfg`, dbt CLI configuration, Control-M CLI
+configuration, or generated runtime JSON.
+
+## Live operator sequence
+
+If the smoke test is already complete, start the services, seed reference data,
+and arm one fresh deterministic EOD generation. Do not simulate the date yet:
+
+```bash
+make postgres-start
+make health
+make seed
+make eod-readiness-arm DATE=2026-08-14
+make eod-readiness-status DATE=2026-08-14
+```
+
+Show the three EOD readiness topics:
+
+```bash
 make kafka-topics
-make ps
 ```
 
-Open these views before screen sharing:
-
-1. Airflow at `http://localhost:8080`.
-2. Redpanda Console at `http://localhost:8081`.
-3. Control-M Monitoring and Services in the `se-dev` tenant.
-4. Two terminals in `/home/azureuser/retail-data-demo`.
-
-Retrieve Airflow's generated local password if required:
+Build, deploy and order the prepared workflow before producing source events:
 
 ```bash
-cat airflow/config/simple_auth_manager_passwords.json.generated
-```
-
-Run `make health` immediately before the session. All checks must be green.
-
-## 90-minute live agenda
-
-| Elapsed time | Activity |
-|---|---|
-| 00:00–00:05 | Business outcome and assumptions |
-| 00:05–00:13 | Shared data plane and readiness gates |
-| 00:13–00:25 | Airflow run and data-engineering strengths |
-| 00:25–00:40 | Control-M run and business-service strengths |
-| 00:40–00:48 | Side-by-side comparison |
-| 00:48–01:05 | One or two failure scenarios |
-| 01:05–01:25 | Kmart discovery discussion and questions |
-| 01:25–01:30 | Recap, reset and close |
-
-### 1. Set the business context — 5 minutes
-
-Explain the outcome first: after stores close trade, the platform waits for enough
-store-completion events and the supplier advance shipping notice (ASN), builds a
-replenishment recommendation, sends it to the warehouse management system (WMS),
-and confirms intake before the 06:00 pick-wave deadline.
-
-State that the business thresholds and timing are demo assumptions to validate
-with Kmart; they are not represented as Kmart's current production process.
-
-### 2. Show the shared data plane — 8 minutes
-
-In Redpanda Console, show `pos.transactions.v1` and `pos.store-eod.v1`. Then run:
-
-```bash
-make gate-eod DATE=2026-08-14
-make gate-asn DATE=2026-08-14
-```
-
-Point out that both gates are ready. The data generators, Kafka, storage,
-transformations and WMS are common to both orchestrators; this makes the comparison
-about control-plane capabilities rather than two different pipelines.
-
-### 3. Run control plane A: Airflow — 12 minutes
-
-Return the date to a known green state and trigger the DAG:
-
-```bash
-make reset DATE=2026-08-14
-make run-airflow DATE=2026-08-14
-```
-
-In the Airflow graph, show:
-
-- the two rescheduling sensors converging on bronze;
-- the three actual `DatabricksRunNowOperator` tasks;
-- the Cosmos expansion of ten dbt models and their tests;
-- the WMS delivery task as Airflow's end of responsibility.
-
-Be precise about the Databricks tasks: the real open-source Airflow provider is
-being exercised, but its connection points to the local `databricks-local`
-Jobs API surrogate. The demo does not contact Azure Databricks or simulate Spark,
-Delta Lake, clusters, Azure authentication or Azure runtime performance.
-
-Airflow's strongest story here is data-team productivity: Python authoring, a rich
-provider ecosystem, excellent dbt/Cosmos lineage, and detailed per-model operation.
-
-### 4. Run control plane B: Control-M — 15 minutes
-
-Reset the shared data plane. Optionally stop Airflow to prove that Control-M does
-not invoke or depend on it, then order the same trading date:
-
-```bash
-make reset DATE=2026-08-14
-make airflow-stop
+make controlm-build
+make controlm-deploy
 make run-controlm DATE=2026-08-14
 ```
 
-Follow the ordered folder in Control-M Monitoring and show:
-
-- store-completeness and ASN gates converging on bronze;
-- native File Watcher jobs for ASN arrival and WMS acknowledgement;
-- the same bronze, silver, dbt, replenishment and delivery stages;
-- `SLA_PickWave` defining the complete business service through WMS acceptance;
-- the 06:00 service forecast and the likely critical path, if history was prepared.
-
-After the run, restart Airflow:
+In Control-M Monitoring, show `WaitForStoreEODThreshold` in Wait Condition. Then
+publish the live source events and ASN:
 
 ```bash
-make airflow-start
+make simulate DATE=2026-08-14
 ```
 
-Control-M's strongest story is end-to-end operational ownership across data and
-non-data boundaries: agent execution, native file events, downstream confirmation,
-central monitoring, service forecasting and business-SLA management.
+In Redpanda Console, open `retail.store-eod-readiness.v1`. The single public
+message shows the actual/expected counts, percentage, decision, missing stores,
+and `RETAIL_EOD_READY_20260814`. The BMC Event Handler maps that field to
+`setevent`; it does not calculate the threshold.
 
-### 5. Compare the control planes — 8 minutes
+The order wrapper passes both date formats and complete File Watcher paths:
 
-Use the completed runs to make the distinction concrete:
+- `DEMO_DATE=20260814` for filenames;
+- `DEMO_ISO_DATE=2026-08-14` for dbt variables;
+- `ASN_PATH=.../ASN_20260814.csv`;
+- `ACK_PATH=.../REPLEN_ACK_20260814.txt`.
 
-| Question | Airflow | Control-M |
-|---|---|---|
-| Where does it shine? | Python/data engineering, providers, dbt/Cosmos detail | Cross-platform operations, events, service ownership, SLA prediction |
-| End point in this demo | Order written to WMS | WMS acknowledgement received and service measured |
-| Does either own the transformations? | No; both invoke the same idempotent stages | No; both invoke the same idempotent stages |
+Using complete path variables avoids Control-M interpreting the period after an
+AutoEdit date variable as part of the variable expression.
 
-The message is coexistence, not replacement: Airflow remains a strong data
-orchestrator while Control-M governs the wider business service.
+In Monitoring, follow this sequence:
 
-### 6. Demonstrate one or two failures — 17 minutes
+1. `WaitForStoreEODThreshold` and `WaitSupplierASN` converge.
+2. `LandKafkaEvents` and `ValidateSourceContract` finish idempotently.
+3. `SyncDeltaSources` starts the real Azure notebook and verifies all six counts.
+4. `DbtBronze`, `DbtSilver`, and `DbtGold` invoke dbt Cloud through the native
+   plug-in and wait for each remote result.
+5. `ExportAzureOrder` downloads the deterministic CSV from the tested gold table.
+6. `DeliverToWMS` writes the file through SFTP.
+7. `ConfirmWMSIntake` detects the acknowledgement.
+8. `SLA_PickWave` closes the complete service.
 
-Choose scenarios based on the audience rather than attempting all five live.
+The cluster can take several minutes to start after auto-termination. That is
+expected, observable runtime—not a reason to bypass the Azure stages.
 
-For the policy discussion, one late store proceeds with a named exception, whereas
-eight late stores hold the run:
+The download uses a same-directory temporary file followed by atomic replacement,
+so it safely replaces a deterministic CSV previously written by a container even
+when that older file has a different host owner.
+
+## 90-minute agenda
+
+| Elapsed time | Activity |
+|---|---|
+| 00:00–00:05 | Business outcome, fictional assumptions and service boundary |
+| 00:05–00:15 | Kafka events, EOD policy and supplier ASN gate |
+| 00:15–00:25 | Pre-silver contract and idempotent Delta synchronization |
+| 00:25–00:45 | Native Control-M dbt Bronze, Silver and Gold jobs |
+| 00:45–00:58 | Azure gold export, WMS delivery and acknowledgement |
+| 00:58–01:10 | SLA and Control-M operational ownership |
+| 01:10–01:25 | One failure scenario and customer discovery |
+| 01:25–01:30 | Reset, recap and close |
+
+### Talking points
+
+- The data date is explicit and replayable; Control-M's order date remains the
+  live date used by the 06:00 SLA.
+- The 319th unique marker makes a 325-store date eligible. A complete day emits
+  immediately; an eligible incomplete day waits for a three-second quiet window.
+  The compacted Kafka state record, input offset, and public readiness message are
+  committed transactionally; Databricks does not need to stay awake as a signal
+  ledger.
+- The ASN schema is checked before destructive silver replacement.
+- Delta windows, dbt tables and the WMS filename are deterministic and safe to
+  rerun for the same date.
+- Control-M owns dependencies, retries, cross-platform visibility,
+  acknowledgement and SLA. It does not own the transformation SQL.
+- dbt Cloud owns the model graph and tests; Azure Databricks supplies the compute.
+- The service token provisions and triggers dbt Cloud. The separate Databricks
+  deployment credential authorizes SQL execution.
+- The optional Airflow path remains a separate local control plane. It still uses
+  `databricks-local`, Cosmos and Postgres, and intentionally stops at delivery.
+
+The EOD readiness projector and BMC Event Handler do not use Postgres. Keep
+Postgres running for the still-local ingress, source-validation, stage-metadata and
+WMS acknowledgement components in this transitional profile. The separate
+Postgres-isolation proof remains valid only after `make databricks-azure-sync`; it
+is not part of this end-to-end Control-M sequence.
+
+## Recommended failure demonstrations
+
+Late-store policy:
 
 ```bash
-make reset DATE=2026-08-14
+make eod-readiness-arm DATE=2026-08-14
 make fail-1 STORES=1 DATE=2026-08-14
-make gate-eod DATE=2026-08-14
+make run-controlm DATE=2026-08-14
+make simulate DATE=2026-08-14
+# 324/325 publishes PROCEED_WITH_EXCEPTIONS.
 
 make reset DATE=2026-08-14
+make eod-readiness-arm DATE=2026-08-14
 make fail-1 STORES=8 DATE=2026-08-14
-make gate-eod DATE=2026-08-14
+make run-controlm DATE=2026-08-14
+make simulate DATE=2026-08-14
+# 317/325 publishes no readiness event; the Dummy job remains waiting.
 ```
 
-The final command deliberately exits non-zero because `HOLD` is a failed gate.
+Run `make reset DATE=2026-08-14` to publish the withheld markers and restore the
+normal modes after the hold demonstration.
 
-For a data-contract failure, show that an unannounced ASN column is rejected before
-silver changes:
+ASN schema drift:
 
 ```bash
 make reset DATE=2026-08-14
@@ -191,57 +302,56 @@ make bronze DATE=2026-08-14
 make silver DATE=2026-08-14
 ```
 
-The silver command deliberately fails. Do not wait through the 90-minute ASN
-non-arrival scenario live; demonstrate its immediate state with `make fail-2`
-followed by `make gate-asn`, and explain how each orchestrator owns the wait and
-timeout.
+The silver command must fail before changing the partition. Do not sync that
+failed input to Azure.
 
-### 7. Kmart discovery discussion — 20 minutes
-
-Use what the audience just saw to validate the assumptions in the scenario:
-
-- Is replenishment primarily overnight, intraday, or both?
-- What are the real store-close and distribution-centre cut-off times?
-- Which platforms currently own POS completeness and supplier ASN arrival?
-- What constitutes successful WMS intake: file receipt, validation or pick-wave
-  creation?
-- Where do Airflow, Azure Databricks and Control-M already operate today?
-- Which team owns an end-to-end missed service deadline and its escalation?
-- For the next iteration, should the portable local Jobs API surrogate remain, or
-  should the demo add a separately configured real-Azure Databricks profile?
-
-### 8. Recap and close — 5 minutes
-
-Reinforce three points: both orchestrators used the same idempotent data plane;
-Airflow exposed excellent data-engineering and dbt detail; Control-M extended
-ownership through downstream acknowledgement and a forecastable business SLA.
-
-Always return the demo to green and confirm health before ending the presentation:
+dbt quality gate:
 
 ```bash
+make reset DATE=2026-08-14
+make fail-4 ROWS=400 DATE=2026-08-14
+make databricks-azure-sync DATE=2026-08-14
+```
+
+Order the Control-M folder. `DbtSilver` must expose the negative-stock test
+failure and prevent Gold/WMS work. Afterwards run `make reset`, resynchronize and
+rerun the failed path.
+
+WMS outcomes remain independently configurable with `make wms-never-ack`, `make
+wms-late`, and `make wms-reject`.
+
+## Restore and shutdown
+
+Always leave the local date green:
+
+```bash
+make postgres-start
 make reset DATE=2026-08-14
 make health
 ```
 
-## Optional failure appendix
+The Azure cluster terminates after its inactivity timeout. Stop Compose while
+retaining named volumes with `make down`. Use `make clean` only when deliberately
+discarding all local named-volume data; it is destructive.
 
-Run these only when time and audience interest permit:
+## Prior rehearsal evidence
 
-1. `make fail-2` removes and suppresses the ASN. `make gate-asn` reports it absent
-   immediately; Airflow and Control-M retain their configured 90-minute wait story.
-2. `make fail-4 ROWS=400`, followed by `make dbt`, demonstrates quality-test
-   failure. After `make reset`, `make dbt-retry` resumes from the prior dbt failure.
-3. `make fail-5 SECONDS=45` adds contention without causing a technical failure;
-   use prepared Control-M history to show the SLA forecast move.
-4. `make wms-never-ack`, `make wms-late` and `make wms-reject` separate successful
-   data delivery from successful business intake.
+The pre-event-driven integrated profile was exercised on `2026-08-10` with data
+date `2026-08-14`. This evidence validates the downstream Azure/dbt/WMS path, not
+the newly added Event Handler boundary:
 
-## Post-session shutdown
+- Control-M Run service ID `d18b666c-915a-4c40-aa01-b89408f1456b`, folder
+  `IN01:1et9m`: all 12 jobs ended OK.
+- Azure source-sync run `657714571780050`: 2,000 products, 65,000 POS rows, 325
+  EOD rows, 5,000 ASN rows, 26,000 stock rows, and 364,000 history rows.
+- dbt Cloud runs `70506183612595`, `70506183612597`, and `70506183612598`:
+  Bronze, Silver, and Gold all succeeded with no failed model or test result.
+- Azure export run `661859322459567`: 7,921 deterministic order lines.
+- WMS received the 7,922-line file including its header and produced
+  `ACCEPTED REPLEN_ORDER_20260814.csv`.
 
-Stop the containers without losing seeded state when the session is over:
-
-```bash
-make down
-```
-
-Use `make clean` only when deliberately discarding all named volumes.
+The rehearsal uncovered and fixed three environment-boundary issues now covered
+by scripts and tests: the Agent's old CA store, double quotes in the version 1.0.01
+plug-in override payload, and replacement of an older root-owned outbound file.
+Kafka broker offsets are intentionally cumulative; use the idempotent ingress
+counts (65,000 POS and 325 EOD for this date) when proving the logical run contract.
