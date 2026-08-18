@@ -91,6 +91,7 @@ Important contracts:
 | `docs/ARCHITECTURE.md` | Architecture decision, as-built boundaries and rerun rules |
 | `docs/OPERATIONS.md` | Provisioning, startup, commands and recovery |
 | `docs/RUNSHEET.md` | Canonical comparison/presentation sequence |
+| `talktrack.md` | Timed 23-minute presenter script derived from the focused docs |
 | `docker-compose.yml` | Local simulation/control-plane topology |
 | `Makefile` | Canonical operator command surface |
 | `demo/` | Generators, readiness, landing, gates, WMS and failure logic |

@@ -49,8 +49,9 @@ There is no PostgreSQL business-data store, Azurite boundary, local Databricks
 surrogate or local dbt execution. Airflow uses SQLite only for its own standalone
 demo metadata.
 
-See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), and the
-[presentation runsheet](docs/RUNSHEET.md).
+See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), the
+[presentation runsheet](docs/RUNSHEET.md), and the detailed
+[23-minute talk track](talktrack.md).
 
 ## Local and external components
 
