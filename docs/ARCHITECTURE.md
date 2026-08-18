@@ -4,43 +4,91 @@
 flowchart TB
     subgraph control_a["CONTROL PLANE A — AIRFLOW"]
         direction LR
-        airflow_sensors["Rescheduling sensors"] --> airflow_440_441["Databricks operators<br/>jobs 440 / 441"]
+        airflow_sensors["Rescheduling sensors"] --> airflow_440_441["DatabricksRunNowOperator<br/>jobs 440 / 441"]
         airflow_440_441 --> airflow_dbt["Cosmos / dbt<br/>10 models"]
-        airflow_dbt --> airflow_447["Databricks operator<br/>job 447"]
+        airflow_dbt --> airflow_447["DatabricksRunNowOperator<br/>job 447"]
         airflow_447 --> airflow_delivery["SFTP delivery"]
-    end
-
-    subgraph shared["SHARED DATA PLANE"]
-        direction LR
-        simulator["Store simulator"] --> redpanda["Redpanda"]
-        redpanda --> ingress["Ingress"] --> bronze["Bronze"] --> silver["Silver"] --> gold["Gold"]
-        asn_generator["ASN generator"] --> azurite["Azurite"] --> bronze
-        redpanda --> eod_projector["EOD readiness projector"] --> readiness_topic["Readiness topic"]
-        wms["WMS SFTP / acknowledgement"]
     end
 
     subgraph control_b["CONTROL PLANE B — INTEGRATED CONTROL-M PROFILE"]
         direction LR
         agent["Control-M host Agent"] --> source_gates["EOD event + ASN File Watcher"]
-        source_gates --> local_stages["Local Bronze / Silver commands"]
-        local_stages --> delta_sync["Azure Delta sync"]
-        delta_sync --> dbt_cloud["dbt Cloud<br/>Bronze / Silver / Gold"]
-        dbt_cloud --> azure_export["Azure Gold export + SFTP delivery"]
+        source_gates --> local_stages["Local jobs 440 / 441"]
+        local_stages --> delta_sync["Azure source sync"]
+        delta_sync --> ctm_dbt["Native Job:DBT<br/>Bronze / Silver / Gold"]
+        ctm_dbt --> azure_export["Azure Gold export + SFTP delivery"]
         azure_export --> ack_watch["ACK File Watcher"] --> sla["06:00 SLA"]
     end
 
+    subgraph local["SHARED LOCAL DATA PLANE — DOCKER COMPOSE"]
+        direction LR
+        simulator["Store simulator"] --> redpanda["Redpanda"]
+        redpanda --> kafka_ingest["kafka-ingest"]
+        asn_generator["ASN generator"] --> azurite["Azurite Blob<br/>+ runtime/asn mirror"]
+        redpanda --> eod_projector["EOD readiness projector"] --> readiness_topic["Readiness topic"]
+        jobs_api["databricks-local<br/>Jobs API surrogate<br/>NOT Spark / Delta / Azure"]
+
+        subgraph postgres["LOCAL POSTGRES — TABLES AND VIEWS"]
+            direction LR
+            ingress["ingress schema"] --> bronze["bronze schema"] --> silver["silver schema"]
+            silver --> local_dbt["staging + intermediate + gold schemas<br/>local dbt objects"]
+        end
+
+        kafka_ingest --> ingress
+        azurite --> bronze
+        wms["WMS SFTP / acknowledgement"]
+    end
+
+    subgraph dbt_service["EXTERNAL DBT SERVICE"]
+        dbt_cloud["dbt Cloud"]
+    end
+
+    subgraph azure["OPTIONAL REAL AZURE DATABRICKS — CONTROL-M INTEGRATED PROFILE"]
+        direction LR
+        databricks_compute["Azure Databricks<br/>single-node Spark cluster<br/>legacy Hive Metastore"]
+        azure_silver["silver Delta tables<br/>6 synced sources"]
+        azure_silver --> azure_staging["staging views<br/>dbt tag: bronze"]
+        azure_staging --> azure_intermediate["intermediate tables<br/>dbt tag: silver"]
+        azure_intermediate --> azure_gold["gold marts<br/>dbt tag: gold"]
+        databricks_compute --- azure_silver
+        databricks_compute --- azure_staging
+        databricks_compute --- azure_intermediate
+        databricks_compute --- azure_gold
+    end
+
     readiness_topic --> event_handler["BMC Event Handler<br/>machine-local kind"] --> source_gates
+    azurite -.->|host-visible ASN| source_gates
     airflow_sensors -.->|reads| ingress
     airflow_sensors -.->|reads| azurite
-    airflow_440_441 -.->|invokes| bronze
-    airflow_dbt -.->|builds| gold
-    gold -.->|feeds| airflow_447
+    airflow_440_441 -.->|real provider calls local API| jobs_api
+    airflow_447 -.->|real provider calls local API| jobs_api
+    jobs_api -.->|executes Python stages| bronze
+    jobs_api -.->|executes Python stages| silver
+    airflow_dbt -.->|builds locally| local_dbt
+    local_dbt -.->|feeds job 447| jobs_api
     airflow_delivery -.->|writes| wms
-    local_stages -.->|invokes| bronze
-    silver -.->|snapshot| delta_sync
+    local_stages -.->|calls local API| jobs_api
+    silver -.->|consistent CSV snapshot| delta_sync
+    delta_sync -.->|runs load notebook| databricks_compute
+    delta_sync -.->|writes| azure_silver
+    ctm_dbt -.->|triggers| dbt_cloud
+    dbt_cloud -.->|runs dbt on| databricks_compute
+    azure_gold -.->|read by export| azure_export
     azure_export -.->|writes| wms
     wms -.->|acknowledges| ack_watch
 ```
+
+The medallion-style names in the local path are Postgres objects, not Azure
+Databricks tables. In the default Airflow profile, `databricks-local` only emulates
+the Jobs API used by the real Airflow provider; jobs 440, 441 and 447 execute Python
+against Postgres and Azurite. Local dbt then creates the `staging`, `intermediate`
+and `gold` Postgres schemas.
+
+The optional integrated Control-M profile is the path that uses real Azure
+Databricks. It copies six prepared local `silver` sources into `silver` Delta
+tables, then dbt Cloud builds four `staging` views (presented as Bronze), two
+`intermediate` tables (presented as Silver), and four `gold` marts on the Azure
+Databricks cluster.
 
 The generators, database transforms, local Jobs API and WMS contain no schedule,
 dependency, retry or next-step choice. Continuous Kafka ingress and the WMS watcher
@@ -70,7 +118,7 @@ images.
 | `kafka-init` / `blob-init` | One-shot topic and Blob-container initialization | Redpanda / Azurite |
 | `kafka-ingest` | Continuous, idempotent event landing | Postgres |
 | `eod-readiness` | Unique-store threshold projection | compacted Kafka state topic |
-| `databricks-local` | Jobs API and independently triggerable stages | Postgres/Blob |
+| `databricks-local` | Jobs API surrogate and independently triggerable Python stages; not Spark, Delta or Azure Databricks | Postgres/Blob |
 | `wms-sftp` | Downstream SFTP boundary | `wms-data` |
 | `wms-ack-writer` | Configurable ack/reject behaviour | `wms-data` / Postgres |
 | Airflow init/API/scheduler/DAG processor/triggerer | Control plane A only | Postgres plus `airflow/logs` and `airflow/config` host binds |
