@@ -5,7 +5,7 @@ checking it, connecting to its services, and stopping it safely.
 
 ## What starts automatically with the VM
 
-The enrolled Control-M Agent is the one intentional host component. Its systemd
+The enrolled Control-M Agent is the systemd-managed host execution component. Its
 service is enabled and starts after the network is online:
 
 ```bash
@@ -15,9 +15,11 @@ systemctl status controlm-agent
 The service uses the vendor `start-ag` command at startup and `shut-ag` during VM
 shutdown. The logical Agent name is `fmo-azureuser`.
 
-Docker containers are managed by the repository's single master
-`docker-compose.yml`. Start them explicitly after logging into the VM so the
-operator can see whether preparation succeeded.
+The BMC Event Handler is a separate integration in the machine-local kind cluster;
+verify or reconcile it with the commands in the Control-M Event Handler section.
+The demo application's other containers are managed by the repository's single
+master `docker-compose.yml`. Start those Compose services explicitly after logging
+into the VM so the operator can see whether preparation succeeded.
 
 ## One-command cold start
 
@@ -31,16 +33,18 @@ make demo-ready DATE=2026-08-14
 `demo-ready` performs these operations in order:
 
 1. Uses the repository's master `docker-compose.yml` file to build the images and
-   start all demo containers as one application.
-2. Checks Kafka, Azurite, Postgres, the local Jobs API surrogate, WMS, Airflow and
-   the Control-M Agent.
+   start all Compose application containers.
+2. Checks Kafka, the EOD readiness projector, Azurite, Postgres, the local Jobs API
+   surrogate, WMS, Airflow and the Control-M Agent.
 3. Seeds 325 stores, the Australian trading calendar, 2,000 products and 28 days
    of sales history.
 4. Generates 65,000 POS events, store EOD markers and the supplier ASN.
 5. Resets all failure modes and leaves the standard trading date ready to run.
 
-The first image build can take several minutes. Seeding and simulation are
-idempotent, so the command is safe to repeat for the same date.
+The first image build can take several minutes. The command is safe to repeat for
+the same date: seeds use upserts/date replacement and simulated events have
+deterministic IDs. Redpanda still retains each repeated publication in its log;
+continuous ingress collapses those repeats onto the same natural keys.
 
 ## Faster subsequent start
 
@@ -52,6 +56,11 @@ make up
 make health
 make reset DATE=2026-08-14
 ```
+
+`reset` restores the local date and clears its deterministic WMS inbound,
+acknowledgement and rejection files, but it does not arm a new Kafka readiness
+generation. Run `make eod-readiness-arm DATE=...` separately before a replay that
+uses the event-driven Control-M gate.
 
 Inspect containers or logs with:
 
@@ -305,9 +314,10 @@ separate adapter actions:
 2. `databricks/sync_silver.py` uploads the files to
    `dbfs:/tmp/retail-data-demo/YYYYMMDD/` and imports the checked-in
    `00_load_silver` notebook under `/Shared/retail-data-demo/`.
-3. A one-time Databricks run validates the manifest and atomically replaces the
-   matching date windows in six `silver` Delta tables in the legacy Hive
-   Metastore. Repeating the same date replaces the same partitions.
+3. A one-time Databricks run validates the manifest and writes six `silver` Delta
+   tables in the legacy Hive Metastore. It replaces `product_master` as a whole and
+   uses the matching `replaceWhere` date window for the other five tables. Repeating
+   the same date replaces the same whole-table/window targets.
 
 Run `make silver DATE=...` first. The Azure adapter deliberately does not
 reimplement or weaken the pre-silver ASN header contract: a failed local silver
@@ -329,15 +339,15 @@ make dbt-cloud-databricks-provision
 
 This mutates the connected dbt Cloud account. It is idempotent by the names
 `Retail demo Azure Databricks` and `Azure Databricks Development`, preserves the
-existing Postgres connection, and records only generated object IDs in ignored
-`runtime/dbt_cloud/azure.json`. The script reads the Databricks hostname and HTTP
-path from generated state. It prefers `DBT_CLOUD_HOST`, `DBT_CLOUD_ACCOUNT_ID`,
-`DBT_CLOUD_PROJECT_ID`, and `DBT_CLOUD_SERVICE_TOKEN` from the ignored root `.env`;
-if the project ID is blank or still a placeholder, it uses the `dbt-cloud` project
-ID in `dbt_project.yml`. When the remaining service-token fields are incomplete,
-it falls back to the personal dbt Cloud CLI configuration. It never writes either
-credential into source. `make prepare` restricts `.env` permissions to the current
-user.
+existing Postgres connection, and records generated object IDs plus non-secret
+names/profile metadata in ignored `runtime/dbt_cloud/azure.json`. The script reads
+the Databricks hostname and HTTP path from generated state. It prefers
+`DBT_CLOUD_HOST`, `DBT_CLOUD_ACCOUNT_ID`, `DBT_CLOUD_PROJECT_ID`, and
+`DBT_CLOUD_SERVICE_TOKEN` from the ignored root `.env`; if the project ID is blank
+or non-numeric, it uses the `dbt-cloud` project ID in `dbt_project.yml`. When the
+remaining service-token fields are incomplete, it falls back to the personal dbt
+Cloud CLI configuration. It never writes either credential into source.
+`make prepare` restricts `.env` permissions to the current user.
 
 The connected dbt tenant currently exposes the connection as `databricks_v0` and
 rejects that adapter when an environment requests `latest-fusion`. The script
@@ -376,12 +386,14 @@ make controlm-dbt-trust
 make controlm-dbt-provision
 ```
 
-`controlm-dbt-trust` is an idempotent host operation. It adds the public ISRG Root
-X1 certificate to the Application Integrator trust store, retaining a backup, and
-restarts only that plug-in container. This is required on an older Agent trust
-store when dbt Cloud reports `PKIX path building failed`; it does not disable TLS
-certificate verification. Override `CTM_AGENT_HOME`, `CTM_DBT_CA_FILE`, or
-`CTM_AI_TRUSTSTORE_PASSWORD` only when the local Agent installation differs.
+`controlm-dbt-trust` is an idempotent host operation. When the certificate is
+absent, it retains one backup of the trust store, adds the public ISRG Root X1
+certificate, and restarts only the Application Integrator plug-in container. If
+the certificate is already present, it only starts that container when needed.
+This is required on an older Agent trust store when dbt Cloud reports
+`PKIX path building failed`; it does not disable TLS certificate verification. Override
+`CTM_AGENT_HOME`, `CTM_DBT_CA_FILE`, or `CTM_AI_TRUSTSTORE_PASSWORD` only when the
+local Agent installation differs.
 
 `controlm-dbt-provision` writes the dbt service token into centralized profile
 `FMO_AZURE_DBT` through a mode-0600 temporary file and removes that file after
@@ -390,15 +402,18 @@ operation, so its first real `Job:DBT` execution is the effective test.
 
 The current validated result is one SMART folder, 12 jobs and a valid development
 descriptor. It contains three native `Job:DBT` jobs between Azure source sync and
-the Azure Gold export. Deployment and ordering are separate external changes:
+the Azure Gold export. `DbtGold` alone is configured for up to two automatic
+one-minute reruns from its point of failure; Bronze and Silver failures require an
+operator rerun. Deployment and ordering are separate external changes:
 
 ```bash
 make controlm-deploy
 make run-controlm DATE=2026-08-14
 ```
 
-`controlm-deploy` changes `se-dev`, and `run-controlm` starts workload in that
-environment. Use each only when that external action is explicitly intended.
+`controlm-deploy` changes the environment selected by `CTM_ENV` (default `se-dev`),
+and `run-controlm` starts workload there. Use each only when that external action
+is explicitly intended.
 
 `run-controlm` orders the folder on Control-M's live business date, preserving a
 meaningful 06:00 SLA clock, and passes `DEMO_DATE=20260814`,
@@ -425,13 +440,21 @@ sequence with:
 make demo-controlm-azure DATE=2026-08-14
 ```
 
-This explicitly arms a new EOD generation, orders asynchronously, and only then
-publishes the POS/EOD and ASN inputs. Monitor `WaitForStoreEODThreshold` in Wait
-Condition, the readiness message in Redpanda Console, and all 12 jobs through Azure
-Delta synchronization, the three dbt Cloud plug-in calls, Azure Gold export, WMS
-delivery, acknowledgement, and SLA closure. The readiness projector itself has no
-Postgres dependency. Keep Postgres running for the still-local ingress/conformance,
-run-metadata, and acknowledgement components in this transitional profile.
+This target does not call `reset`. Before repeating the same date, first run
+`make reset DATE=...` to restore failure modes and remove its deterministic WMS
+inbound, acknowledgement and rejection files. Reset deliberately regenerates the
+standard ASN, so its File Watcher can complete immediately on a same-date replay;
+on a cold runtime with no prior ASN, the target invokes `simulate` only after
+ordering and the two source waits are visible together.
+
+The target explicitly arms a new EOD generation, orders asynchronously, and only
+then invokes the POS/EOD and ASN simulation step. Monitor
+`WaitForStoreEODThreshold` in Wait Condition, the readiness message in Redpanda
+Console, and all 12 jobs through Azure Delta synchronization, the three dbt Cloud
+plug-in calls, Azure Gold export, WMS delivery, acknowledgement, and SLA closure.
+The readiness projector itself has no Postgres dependency. Keep Postgres running
+for the still-local ingress/conformance, run-metadata, and acknowledgement
+components in this transitional profile.
 
 Postgres isolation is a presentation action, not a normal stack state. Use it only
 after a successful Azure sync:

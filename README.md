@@ -19,12 +19,15 @@ customer before presenting.
 `docker-compose.yml` is the master file. It starts Redpanda (Kafka API), the
 Kafka-native EOD readiness projector, Azurite (Azure Blob API), Postgres, a
 Databricks Jobs API-compatible local stage runner, an SFTP WMS and
-acknowledgement writer, the data generators, and Airflow.
+acknowledgement writer, and Airflow. The on-demand toolbox service runs the data
+generators and operator CLI.
 
-The Control-M Agent is the only deliberate host component. Its SaaS enrollment and
-identity already belong to this machine and must not be copied into an image. Every
-job it launches executes inside the Compose application through
-`controlm/scripts/run_stage.sh`.
+The enrolled Control-M Agent is the deliberate host execution component. Its SaaS
+identity already belongs to this machine and must not be copied into an image.
+Host command jobs enter the Compose application through
+`controlm/scripts/run_stage.sh`; native `Job:DBT` work goes directly to dbt Cloud.
+The BMC Event Handler is a separate integration boundary in the machine-local kind
+cluster: it reads the committed readiness topic and calls Control-M `setevent`.
 
 The checked-in `controlm-agent.service` only manages that existing host Agent. It
 does not install, enroll, or copy Agent credentials, and it has no dependency on
