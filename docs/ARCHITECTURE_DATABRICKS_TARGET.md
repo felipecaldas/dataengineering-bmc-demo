@@ -15,10 +15,12 @@ tables in Azure Databricks. dbt Cloud connects only to Azure Databricks. There i
 no Postgres database, no local Jobs API surrogate, and no duplicate local
 Bronze/Silver/Gold implementation.
 
-Control-M owns the complete business-service flow from source readiness through
-WMS acknowledgement and the 06:00 pick-wave SLA. Databricks notebooks and dbt
-models remain independently rerunnable data-processing units; they contain no
-schedule, dependency, retry or downstream orchestration decisions.
+Two independent control planes orchestrate that same data plane. Airflow owns its
+workflow from source readiness through WMS delivery. Control-M owns its separate
+workflow from source readiness through WMS acknowledgement and the 06:00 pick-wave
+SLA. Neither control plane invokes the other. Databricks notebooks and dbt models
+remain independently rerunnable data-processing units; they contain no schedule,
+dependency, retry or downstream orchestration decisions.
 
 The local components retained for the demonstration are source and downstream
 simulators:
@@ -31,12 +33,22 @@ simulators:
   locally.
 - The WMS SFTP service receives the order and writes an acknowledgement file.
 - The EOD readiness projector keeps its replay state in a compacted Kafka topic.
+- A single-container Airflow 3.3 standalone runtime stores only its own demo
+  control-plane metadata in an embedded SQLite file.
 
-The Airflow comparison is not part of this target runtime. The current local
-Airflow deployment needs a metadata database and depends on the local surrogate.
-If an Airflow comparison is required later, it must be deployed separately and
-invoke the same Azure Databricks jobs and dbt Cloud jobs; it must not introduce a
-second business-data implementation.
+Airflow is part of the target runtime and must be migrated with the data plane. Its
+Databricks connection points to the real Azure workspace, and its dbt tasks trigger
+the same pre-existing dbt Cloud jobs as Control-M. The current Cosmos/local-dbt
+task group is therefore replaced by dbt Cloud provider tasks. This deliberately
+trades ten per-model Cosmos tasks for a fair comparison in which both control
+planes monitor the same three remote dbt jobs.
+
+Airflow still requires an internal metadata store. For this local, single-user
+demo, the target uses the pinned Airflow 3.3 `standalone` runtime with an embedded
+SQLite file on an Airflow-only volume. That file contains DAG runs, task instances
+and UI state—never retail events, medallion data, WMS state or transformation
+results. It is a demo packaging choice, not a recommended production Airflow
+database. There is no Postgres service or connection string in the target stack.
 
 ## Target component and trust-boundary view
 
@@ -50,6 +62,21 @@ flowchart TB
         reference_generator["Reference and history generator"]
         redpanda --> projector["EOD readiness projector<br/>Kafka transactional state"]
         projector --> readiness_topic["Readiness topic"]
+    end
+
+    subgraph airflow["CONTROL PLANE A — AIRFLOW"]
+        direction LR
+        airflow_runtime["Airflow 3.3 standalone"] --- airflow_metadata["Embedded SQLite<br/>Airflow metadata only"]
+        airflow_runtime --> airflow_eod["Kafka readiness sensor"]
+        airflow_runtime --> airflow_asn["Azure ASN sensor"]
+        airflow_eod --> airflow_stage["StageInputsToAzure<br/>shared stateless adapter"]
+        airflow_asn --> airflow_stage
+        airflow_stage --> airflow_ingest["IngestBronze<br/>DatabricksRunNowOperator"]
+        airflow_ingest --> airflow_dbt_stage["DbtStage<br/>dbt Cloud provider"]
+        airflow_dbt_stage --> airflow_dbt_intermediate["DbtIntermediate<br/>dbt Cloud provider"]
+        airflow_dbt_intermediate --> airflow_dbt_gold["DbtGold<br/>dbt Cloud provider"]
+        airflow_dbt_gold --> airflow_export["ExportReplenishment<br/>DatabricksRunNowOperator"]
+        airflow_export --> airflow_deliver["SFTP delivery<br/>Airflow endpoint"]
     end
 
     subgraph controlm["CONTROL-M CONTROL PLANE"]
@@ -111,10 +138,20 @@ flowchart TB
     end
 
     readiness_topic --> event_handler
+    readiness_topic --> airflow_eod
     supplier --> azure_landing
     supplier --> asn_marker
     reference_generator --> azure_landing
     asn_marker --> wait_asn
+    airflow_asn -.->|"sense object"| azure_landing
+    airflow_stage -.->|"consume date-scoped Kafka records"| redpanda
+    airflow_stage -.->|"write events and manifest"| azure_landing
+    airflow_ingest -.->|"submit and monitor"| notebook_00
+    airflow_dbt_stage -.->|"trigger and monitor"| dbt_jobs
+    airflow_dbt_intermediate -.->|"trigger and monitor"| dbt_jobs
+    airflow_dbt_gold -.->|"trigger and monitor"| dbt_jobs
+    airflow_export -.->|"submit and monitor"| notebook_04
+    airflow_deliver -.->|"transfer deterministic file"| azure_outbound
     stage_inputs -.->|"consume date-scoped Kafka records"| redpanda
     stage_inputs -.->|"write events and manifest"| azure_landing
     ingest_job -.->|"submit and monitor"| notebook_00
@@ -138,7 +175,8 @@ Redpanda broker is not directly reachable from the Azure workspace. Its outputs
 are immutable or deterministically replaceable files plus a manifest; it has no
 query engine and creates no second source of truth. The supplier arrival marker is
 written only after the Azure upload succeeds and identifies the object path and
-checksum that the downstream manifest must contain.
+checksum that the downstream manifest must contain. Airflow and Control-M invoke
+the same adapter implementation with the same trading-date contract.
 
 ## End-to-end Control-M service
 
@@ -180,7 +218,34 @@ Every remote submission is synchronous from Control-M's perspective: Control-M
 waits for the Databricks or dbt Cloud run result and prevents downstream work when
 the remote job or a data test fails. Retry policy and service forecasting belong
 to Control-M; transformation SQL belongs to dbt Cloud; Spark/Delta execution
-belongs to Azure Databricks.
+belongs to Azure Databricks. Airflow's remote operator tasks also wait for the same
+Databricks and dbt Cloud results and enforce the same downstream gates.
+
+## Equivalent Airflow workflow
+
+```mermaid
+flowchart LR
+    eod["Kafka readiness sensor"] --> stage["StageInputsToAzure"]
+    asn["Azure ASN sensor"] --> stage
+    stage --> ingest["00_ingest_bronze<br/>Azure Databricks"]
+    ingest --> dbt_stage["DbtStage<br/>dbt Cloud"]
+    dbt_stage --> dbt_intermediate["DbtIntermediate<br/>dbt Cloud"]
+    dbt_intermediate --> dbt_gold["DbtGold<br/>dbt Cloud"]
+    dbt_gold --> export["04_export_replenishment<br/>Azure Databricks"]
+    export --> delivery["WMS SFTP delivery"]
+    delivery --> endpoint["Airflow responsibility ends"]
+```
+
+The Airflow DAG uses the real Azure Databricks provider for notebooks `00` and
+`04`, dbt Cloud provider tasks for the three pre-existing jobs, and an Azure object
+sensor for the ASN. Its readiness sensor observes the same Kafka fact that the BMC
+Event Handler maps into a Control-M event. It does not query Databricks repeatedly
+to infer whether store EOD is complete.
+
+Airflow deliberately stops after successful WMS delivery. Control-M deliberately
+continues through acknowledgement and SLA measurement. That difference is the
+comparison; the source data, notebooks, dbt project, remote dbt jobs, Delta tables
+and WMS file are identical.
 
 ## Physical data layers
 
@@ -256,6 +321,7 @@ the target is explicit:
 | Source files, manifests and checksums | Azure landing container |
 | Delta load history and table versions | Azure Databricks Delta history |
 | dbt model and test results | dbt Cloud run artifacts |
+| Airflow DAG runs, task instances and UI state | Airflow-only embedded SQLite volume |
 | Job status, retries and failure messages | Control-M run history |
 | Business-service forecast and completion | Control-M SLA Management |
 | WMS delivery | Deterministic remote filename plus Control-M transfer result |
@@ -306,10 +372,15 @@ flowchart LR
     dbt_api -->|"deployment credential"| databricks_sql["Databricks compute"]
     ctm_agent -->|"Azure workload identity"| azure_storage["Azure storage"]
     ctm_agent -->|"demo SFTP credential"| wms["WMS simulator"]
+    airflow["Airflow standalone"] -->|"Airflow Databricks connection"| databricks_api
+    airflow -->|"Airflow dbt Cloud connection"| dbt_api
+    airflow -->|"Airflow Azure connection"| azure_storage
+    airflow -->|"Airflow SFTP connection"| wms
 ```
 
 - Databricks, dbt Cloud, Azure storage and SFTP credentials remain in their
-  platform connection profiles or host credential stores; none are committed.
+  Control-M connection profiles, Airflow connections or host credential stores;
+  none are committed.
 - The Databricks workspace and dbt Cloud account are real external services and
   may incur cost.
 - The simulator data, thresholds, credentials and WMS remain demo-only and must
@@ -318,7 +389,23 @@ flowchart LR
   hardening decision. It is not required to remove Postgres and must not be
   claimed until configured and verified.
 
-## Control-M job model
+## Control-plane job models
+
+### Airflow tasks
+
+| Task | Airflow capability | Remote/data action |
+|---|---|---|
+| `wait_for_store_eod_threshold` | Kafka-aware rescheduling sensor | Observe the date-scoped readiness fact |
+| `wait_for_supplier_asn` | Azure object sensor | Wait for the successfully uploaded ASN |
+| `stage_inputs_to_azure` | Python task invoking the shared adapter | Write bounded Kafka extracts and the manifest to Azure storage |
+| `ingest_bronze` | `DatabricksRunNowOperator` | Run and monitor `00_ingest_bronze` |
+| `dbt_stage` | dbt Cloud provider task | Run four staging models and tests in dbt Cloud |
+| `dbt_intermediate` | dbt Cloud provider task | Run two intermediate models and tests in dbt Cloud |
+| `dbt_gold` | dbt Cloud provider task | Run four Gold marts and tests in dbt Cloud |
+| `export_replenishment` | `DatabricksRunNowOperator` | Run and monitor `04_export_replenishment` |
+| `deliver_to_wms` | SFTP provider task | Transfer the deterministic CSV to SFTP and end the DAG |
+
+### Control-M jobs
 
 | Job | Control-M capability | Remote/data action |
 |---|---|---|
@@ -339,6 +426,23 @@ installed Control-M plug-ins before implementation. Falling back to a strict hos
 wrapper is acceptable only when the native integration is unavailable; it must
 still submit one remote job and propagate its final status accurately.
 
+### Fair comparison boundary
+
+| Business step | Airflow | Control-M |
+|---|---|---|
+| Store readiness | Kafka-aware rescheduling sensor | Kafka fact mapped to a Control-M event |
+| ASN readiness | Azure object sensor | File Watcher on the successful-upload marker |
+| Source staging | Shared stateless adapter | Same shared stateless adapter |
+| Databricks ingestion | Real Databricks provider | Databricks integration |
+| dbt transformations | dbt Cloud provider tasks | Native `Job:DBT` jobs |
+| WMS delivery | SFTP provider task | Managed file transfer |
+| WMS acknowledgement | Outside DAG boundary | File Watcher inside the service |
+| 06:00 deadline | Outside DAG boundary | SLA Management forecast and measurement |
+
+The comparison changes only orchestration and operational ownership. It does not
+change source records, Azure paths, Databricks tables, dbt code, dbt Cloud job IDs,
+WMS filenames or business rules.
+
 ## Migration from the current repository
 
 | Current component | Target change |
@@ -352,7 +456,10 @@ still submit one remote job and propagate its final status accurately.
 | `DbtBronze` presentation label | Rename to `DbtStage`; Bronze is physically loaded by Databricks |
 | Postgres-backed WMS modes and acknowledgement state | Replace with file/Kafka control state and Control-M history |
 | Postgres-backed stage-run metadata | Replace with platform run results; optionally consolidate into Delta `ops` |
-| Local Airflow services | Exclude from the target Control-M runtime |
+| Postgres-backed multi-service Airflow runtime | Replace with a single Airflow 3.3 standalone container and Airflow-only SQLite volume |
+| Local Cosmos/Postgres dbt task group | Replace with three dbt Cloud provider tasks using the same job IDs as Control-M |
+| Airflow local Databricks connection | Point to the real Azure workspace and real ingestion/export job IDs |
+| Airflow local EOD/ASN sensors | Replace with Kafka readiness and Azure object sensors |
 | Current failure/reset commands | Rework against Kafka state, Azure landing paths and Delta date windows |
 | Current architecture, operations and runsheet | Replace only after the target code passes end-to-end validation |
 
@@ -366,10 +473,16 @@ following are true:
 - No business stage reads from or writes to Postgres, SQLite or another replacement
   relational database.
 - The demo can start and complete with no Postgres process or connection string.
+- Airflow persists only control-plane metadata in its embedded SQLite volume; no
+  business task queries or writes that file.
 - `00_ingest_bronze` reads source artifacts from Azure storage and writes the six
   Bronze Delta tables in the Azure workspace.
 - dbt Cloud builds and tests Silver and Gold exclusively on Azure Databricks.
 - `04_export_replenishment` reads Azure Gold and writes the Azure outbound file.
+- Airflow and Control-M independently invoke the same landing adapter, Databricks
+  jobs, dbt Cloud jobs and WMS delivery contract for the same explicit date.
+- The Airflow path completes at WMS delivery; the Control-M path continues through
+  acknowledgement and the 06:00 SLA.
 - Control-M monitors every remote result, stops on failed contracts/tests,
   transfers the order, observes acknowledgement and measures the 06:00 SLA.
 - The same trading date succeeds twice with identical business output.
@@ -382,12 +495,13 @@ following are true:
 
 The architecture can be explained in one sentence:
 
-> Control-M coordinates the complete retail service across Kafka readiness, an
-> Azure file boundary, Databricks ingestion, dbt Cloud transformations, WMS
-> transfer and acknowledgement, while every business-data layer remains in one
-> Azure Databricks Delta plane.
+> Airflow and Control-M independently orchestrate the same Azure Databricks and dbt
+> Cloud data plane; Airflow demonstrates the data-engineering workflow through WMS
+> delivery, while Control-M demonstrates complete business-service ownership
+> through WMS acknowledgement and the 06:00 SLA.
 
-The value of Control-M is the dependency, cross-platform visibility, rerun,
-downstream acknowledgement and SLA story. The value of Databricks and dbt Cloud is
-the governed transformation and data-quality plane. There is no database-copy
-story to explain.
+Airflow's value is Python-native DAG authoring, provider integrations and task-level
+data-pipeline visibility. Control-M's value is cross-platform dependency,
+centralized retry, downstream acknowledgement and SLA visibility. Databricks and
+dbt Cloud remain the single governed transformation and data-quality plane for
+both. There is no database-copy story to explain.
