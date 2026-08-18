@@ -1,22 +1,45 @@
 # Architecture and trust boundaries
 
-```text
-                 CONTROL PLANE A
-  Airflow sensors -> Databricks operators -> Cosmos/dbt -> SFTP write
-                         |                         |
-                         +-----------+-------------+
-                                     v
-                         SHARED DATA PLANE
-  store simulator -> Redpanda -> ingress -> bronze -> silver -> gold
-                         |  \-> EOD readiness topic -> BMC Event Handler
-  ASN generator  -> Azurite ------------------^             |
-  WMS SFTP/ack   <------------------------------------------+
-                                     ^
-                         +-----------+-------------+
-                         |                         |
-                 CONTROL PLANE B (INTEGRATED PROFILE)
-  Control-M host Agent -> source gates -> Azure Delta sync -> dbt Cloud
-       -> tagged Bronze/Silver/Gold jobs -> WMS ack file watch -> SLA
+```mermaid
+flowchart TB
+    subgraph control_a["CONTROL PLANE A — AIRFLOW"]
+        direction LR
+        airflow_sensors["Rescheduling sensors"] --> airflow_440_441["Databricks operators<br/>jobs 440 / 441"]
+        airflow_440_441 --> airflow_dbt["Cosmos / dbt<br/>10 models"]
+        airflow_dbt --> airflow_447["Databricks operator<br/>job 447"]
+        airflow_447 --> airflow_delivery["SFTP delivery"]
+    end
+
+    subgraph shared["SHARED DATA PLANE"]
+        direction LR
+        simulator["Store simulator"] --> redpanda["Redpanda"]
+        redpanda --> ingress["Ingress"] --> bronze["Bronze"] --> silver["Silver"] --> gold["Gold"]
+        asn_generator["ASN generator"] --> azurite["Azurite"] --> bronze
+        redpanda --> eod_projector["EOD readiness projector"] --> readiness_topic["Readiness topic"]
+        wms["WMS SFTP / acknowledgement"]
+    end
+
+    subgraph control_b["CONTROL PLANE B — INTEGRATED CONTROL-M PROFILE"]
+        direction LR
+        agent["Control-M host Agent"] --> source_gates["EOD event + ASN File Watcher"]
+        source_gates --> local_stages["Local Bronze / Silver commands"]
+        local_stages --> delta_sync["Azure Delta sync"]
+        delta_sync --> dbt_cloud["dbt Cloud<br/>Bronze / Silver / Gold"]
+        dbt_cloud --> azure_export["Azure Gold export + SFTP delivery"]
+        azure_export --> ack_watch["ACK File Watcher"] --> sla["06:00 SLA"]
+    end
+
+    readiness_topic --> event_handler["BMC Event Handler<br/>machine-local kind"] --> source_gates
+    airflow_sensors -.->|reads| ingress
+    airflow_sensors -.->|reads| azurite
+    airflow_440_441 -.->|invokes| bronze
+    airflow_dbt -.->|builds| gold
+    gold -.->|feeds| airflow_447
+    airflow_delivery -.->|writes| wms
+    local_stages -.->|invokes| bronze
+    silver -.->|snapshot| delta_sync
+    azure_export -.->|writes| wms
+    wms -.->|acknowledges| ack_watch
 ```
 
 The generators, database transforms, local Jobs API and WMS contain no schedule,
