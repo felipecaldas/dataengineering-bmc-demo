@@ -88,10 +88,9 @@ Important contracts:
 | Path | Responsibility |
 |---|---|
 | `README.md` | Overview, quick start and honest boundaries |
-| `docs/ARCHITECTURE.md` | As-built component/data boundaries and rerun rules |
+| `docs/ARCHITECTURE.md` | Architecture decision, as-built boundaries and rerun rules |
 | `docs/OPERATIONS.md` | Provisioning, startup, commands and recovery |
 | `docs/RUNSHEET.md` | Canonical comparison/presentation sequence |
-| `docs/ARCHITECTURE_DATABRICKS_TARGET.md` | Decision record for removing PostgreSQL |
 | `docker-compose.yml` | Local simulation/control-plane topology |
 | `Makefile` | Canonical operator command surface |
 | `demo/` | Generators, readiness, landing, gates, WMS and failure logic |
