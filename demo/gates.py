@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import date
 
 from demo import blob
-from demo.db import connect
+from demo.seed import landing_name, trading_stores
 
 
 @dataclass(frozen=True)
@@ -35,45 +35,24 @@ def classify_percentage(percentage: float, missing: int) -> str:
 
 
 def eod_status(trading_date: date) -> EodGate:
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT s.store_id
-            FROM silver.dim_store s
-            JOIN silver.trading_calendar c
-              ON c.state_code = s.state_code
-             AND c.calendar_date = %s
-            WHERE s.status = 'TRADING'
-              AND s.open_date <= %s
-              AND (s.close_date IS NULL OR s.close_date > %s)
-              AND c.is_trading_day = true
-            ORDER BY s.store_id
-            """,
-            (trading_date, trading_date, trading_date),
-        )
-        expected_ids = [row["store_id"] for row in cur.fetchall()]
-        cur.execute(
-            """
-            SELECT DISTINCT (payload->>'store_id')::int AS store_id
-            FROM ingress.kafka_events
-            WHERE topic = 'pos.store-eod.v1'
-              AND payload->>'trading_date' = %s
-            """,
-            (trading_date.isoformat(),),
-        )
-        actual_ids = {row["store_id"] for row in cur.fetchall()}
-    missing = [store_id for store_id in expected_ids if store_id not in actual_ids]
-    expected = len(expected_ids)
-    actual = expected - len(missing)
-    percentage = (100.0 * actual / expected) if expected else 100.0
-    decision = classify_percentage(percentage, len(missing))
+    # Import lazily because the Kafka readiness projector imports the shared
+    # percentage classifier from this module.
+    from demo.eod_readiness import status
+
+    readiness = status(trading_date)
+    expected_ids = [int(row["store_id"]) for row in trading_stores(trading_date)]
+    expected = int(readiness.get("expected", len(expected_ids)))
+    actual = int(readiness.get("actual", 0))
+    missing = [int(value) for value in readiness.get("missing_store_ids", expected_ids)]
+    percentage = float(readiness.get("percentage", 0.0 if expected else 100.0))
+    decision = str(readiness.get("decision", classify_percentage(percentage, len(missing))))
     return EodGate(
         trading_date.isoformat(), expected, actual, round(percentage, 3), decision, missing
     )
 
 
 def asn_name(trading_date: date) -> str:
-    return f"inbound/ASN_{trading_date:%Y%m%d}.csv"
+    return landing_name(trading_date, "asn_inbound")
 
 
 def order_name(trading_date: date) -> str:

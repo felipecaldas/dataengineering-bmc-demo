@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 import signal
 import time
 from pathlib import Path
 
-from demo.db import connect, get_config
+from demo.config import settings
+from demo.state import get_config, write_json
 
 
 running = True
@@ -17,88 +19,60 @@ def _stop(*_: object) -> None:
     running = False
 
 
+def _claim(path: Path) -> Path | None:
+    claims = Path("/wms/state")
+    claims.mkdir(parents=True, exist_ok=True)
+    claim = claims / f"{path.name}.json"
+    try:
+        descriptor = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return None
+    os.close(descriptor)
+    write_json(claim, {"filename": path.name, "status": "RECEIVED"})
+    return claim
+
+
 def _process(path: Path) -> None:
     match = ORDER_PATTERN.match(path.name)
     if not match:
         return
+    claim = _claim(path)
+    if claim is None:
+        return
     date_key = match.group(1)
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO meta.wms_deliveries(filename, status)
-            VALUES (%s, 'RECEIVED') ON CONFLICT (filename) DO NOTHING
-            """,
-            (path.name,),
-        )
-        cur.execute("SELECT status FROM meta.wms_deliveries WHERE filename=%s", (path.name,))
-        status = cur.fetchone()["status"]
     mode = get_config("wms_mode", "ack") or "ack"
-    if status != "RECEIVED":
-        return
     if mode == "never_ack":
-        with connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE meta.wms_deliveries SET status='NO_ACK' "
-                "WHERE filename=%s AND status='RECEIVED'",
-                (path.name,),
-            )
+        write_json(claim, {"filename": path.name, "status": "NO_ACK"})
         return
-    # Claim the file before sleeping. This prevents the polling loop from
-    # starting multiple acknowledgements for the same delivery.
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE meta.wms_deliveries SET status='PROCESSING'
-            WHERE filename=%s AND status='RECEIVED'
-            RETURNING filename
-            """,
-            (path.name,),
-        )
-        if not cur.fetchone():
-            return
+
+    write_json(claim, {"filename": path.name, "status": "PROCESSING", "mode": mode})
     delay = int(get_config("wms_ack_delay_seconds", "2") or 2)
     if mode == "late":
         delay = max(delay, 30)
     time.sleep(delay)
-    # Reset deletes this row and temporarily switches to never_ack. Re-check
-    # after the delay so a cancelled rehearsal cannot emit a stale ACK/REJECT.
-    current_mode = get_config("wms_mode", "ack") or "ack"
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT status FROM meta.wms_deliveries WHERE filename=%s",
-            (path.name,),
-        )
-        delivery = cur.fetchone()
-    if not delivery or delivery["status"] != "PROCESSING" or current_mode != mode:
+    if not claim.exists() or (get_config("wms_mode", "ack") or "ack") != mode:
         return
+
     if mode == "reject":
         destination = Path("/wms/reject") / f"REPLEN_REJECT_{date_key}.txt"
         destination.write_text(f"REJECTED {path.name}: demo failure mode\n")
-        runtime_destination = Path("/workspace/runtime/wms/reject") / destination.name
-        new_status = "REJECTED"
+        runtime_destination = settings.runtime_root / "wms" / "reject" / destination.name
+        status = "REJECTED"
     else:
         destination = Path("/wms/ack") / f"REPLEN_ACK_{date_key}.txt"
         destination.write_text(f"ACCEPTED {path.name}\n")
-        runtime_destination = Path("/workspace/runtime/wms/ack") / destination.name
-        new_status = "ACKNOWLEDGED"
+        runtime_destination = settings.runtime_root / "wms" / "ack" / destination.name
+        status = "ACKNOWLEDGED"
     runtime_destination.parent.mkdir(parents=True, exist_ok=True)
     runtime_destination.write_text(destination.read_text())
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE meta.wms_deliveries
-            SET status=%s, acknowledged_at=now()
-            WHERE filename=%s AND status='PROCESSING'
-            """,
-            (new_status, path.name),
-        )
+    write_json(claim, {"filename": path.name, "status": status, "mode": mode})
 
 
 def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     inbound = Path("/wms/inbound/replen")
-    for directory in (inbound, Path("/wms/ack"), Path("/wms/reject")):
+    for directory in (inbound, Path("/wms/ack"), Path("/wms/reject"), Path("/wms/state")):
         directory.mkdir(parents=True, exist_ok=True)
     while running:
         for path in sorted(inbound.glob("REPLEN_ORDER_*.csv")):

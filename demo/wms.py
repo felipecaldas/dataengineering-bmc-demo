@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 from datetime import date
 
 import paramiko
@@ -39,4 +38,3 @@ def ack_exists(trading_date: date) -> bool:
             return False
     finally:
         transport.close()
-

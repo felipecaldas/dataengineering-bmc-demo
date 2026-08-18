@@ -1,5 +1,10 @@
 # Kmart DataOps Session 2 — Demo Design
 
+> Historical design record. The implemented Azure Databricks/dbt Cloud profile
+> is documented in `docs/ARCHITECTURE.md`; where this file mentions PostgreSQL,
+> local emulation, dbt Core or superseded job names, the as-built documentation
+> and code take precedence.
+
 **Use case:** Trade Day Close to Store Replenishment
 **Stack:** Kafka (local) · Azure Blob file drop · Databricks on Azure · dbt Core (local) · Airflow (local) · Control-M
 **Session:** 17 August 2026, 90 minutes

@@ -32,35 +32,14 @@ case "$STAGE" in
   gate-eod)
     run_compose run --rm toolbox python -m demo.cli gate-eod --date "$TRADING_DATE" --wait --timeout 120 --interval 5
     ;;
-  bronze)
-    run_compose run --rm toolbox python -m demo.cli databricks-run 440 --date "$TRADING_DATE"
+  stage-inputs)
+    run_compose run --rm toolbox python -m demo.cli stage-inputs --date "$TRADING_DATE"
     ;;
-  silver)
-    run_compose run --rm toolbox python -m demo.cli databricks-run 441 --date "$TRADING_DATE"
+  ingest)
+    python3 databricks/run_job.py ingest --date "$TRADING_DATE"
     ;;
-  azure-sync)
-    python3 databricks/provision_cluster.py
-    run_compose run --rm toolbox python -m demo.cli export-databricks-silver --date "$TRADING_DATE"
-    python3 databricks/sync_silver.py --date "$TRADING_DATE"
-    ;;
-  dbt)
-    retry_marker="runtime/.dbt-retry-${TRADING_DATE//-/}"
-    dbt_command=build
-    [[ -f "$retry_marker" ]] && dbt_command=retry
-    echo "DBT_COMMAND=$dbt_command"
-    if run_compose run --rm toolbox dbt "$dbt_command" --project-dir dbt/kmart_retail --profiles-dir dbt/kmart_retail --vars "{trading_date: '$TRADING_DATE'}"; then
-      rm -f "$retry_marker"
-    else
-      touch "$retry_marker"
-      exit 1
-    fi
-    ;;
-  replen)
-    run_compose run --rm toolbox python -m demo.cli databricks-run 447 --date "$TRADING_DATE"
-    ;;
-  azure-replen)
-    python3 databricks/export_replenishment.py --date "$TRADING_DATE"
-    run_compose run --rm toolbox python -m demo.cli import-databricks-order --date "$TRADING_DATE"
+  export)
+    python3 databricks/run_job.py export --date "$TRADING_DATE"
     ;;
   deliver)
     run_compose run --rm toolbox python -m demo.cli deliver --date "$TRADING_DATE"

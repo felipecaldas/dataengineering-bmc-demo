@@ -4,7 +4,6 @@ import csv
 import io
 import json
 import random
-import time
 import uuid
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
@@ -15,8 +14,8 @@ from confluent_kafka import Producer
 
 from demo import blob
 from demo.config import settings
-from demo.db import connect, get_config
-from demo.gates import asn_name
+from demo.seed import landing_name, trading_stores
+from demo.state import get_config, read_json, simulation_path, write_json
 
 
 def _producer() -> Producer:
@@ -31,22 +30,6 @@ def _producer() -> Producer:
     )
 
 
-def _trading_stores(trading_date: date) -> list[dict]:
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT s.store_id, s.state_code, s.timezone, s.close_time_local
-            FROM silver.dim_store s
-            JOIN silver.trading_calendar c
-              ON c.state_code=s.state_code AND c.calendar_date=%s
-            WHERE s.status='TRADING' AND c.is_trading_day=true
-            ORDER BY s.store_id
-            """,
-            (trading_date,),
-        )
-        return list(cur.fetchall())
-
-
 def _publish(producer: Producer, topic: str, key: str, payload: dict) -> None:
     while True:
         try:
@@ -57,19 +40,37 @@ def _publish(producer: Producer, topic: str, key: str, payload: dict) -> None:
 
 
 def simulate_day(trading_date: date, withhold_count: int | None = None) -> dict:
-    stores = _trading_stores(trading_date)
+    stores = trading_stores(trading_date)
     if not stores:
-        raise RuntimeError(f"No trading stores found for {trading_date}; run 'make seed' first")
+        raise RuntimeError(f"No demo stores are trading on {trading_date}")
     if withhold_count is None:
         withhold_count = int(get_config("withhold_eod_count", "0") or 0)
-    withheld_ids = {row["store_id"] for row in stores[-withhold_count:]} if withhold_count else set()
+    if withhold_count < 0 or withhold_count >= len(stores):
+        raise ValueError("withhold_count must be between zero and the trading-store count minus one")
+
+    simulation_id = str(uuid.uuid4())
+    withheld_ids = (
+        {int(row["store_id"]) for row in stores[-withhold_count:]}
+        if withhold_count
+        else set()
+    )
+    simulation = {
+        "schema_version": 1,
+        "simulation_id": simulation_id,
+        "trading_date": trading_date.isoformat(),
+        "expected_store_ids": [int(row["store_id"]) for row in stores],
+        "withheld_store_ids": sorted(withheld_ids),
+        "released_store_ids": [],
+    }
+    write_json(simulation_path(trading_date), simulation)
+
     producer = _producer()
     transaction_messages = 0
     eod_messages = 0
     for store in stores:
-        store_id = store["store_id"]
+        store_id = int(store["store_id"])
         rng = random.Random(settings.demo_seed + trading_date.toordinal() * 1000 + store_id)
-        timezone_name = store["timezone"]
+        timezone_name = str(store["timezone"])
         tz = ZoneInfo(timezone_name)
         total = Decimal("0")
         for txn_no in range(1, settings.txn_per_store + 1):
@@ -84,6 +85,7 @@ def simulate_day(trading_date: date, withhold_count: int | None = None) -> dict:
                 uuid.uuid5(uuid.NAMESPACE_URL, f"kmart-demo:{trading_date}:{store_id}:{txn_no}")
             )
             payload = {
+                "simulation_id": simulation_id,
                 "transaction_id": transaction_id,
                 "trading_date": trading_date.isoformat(),
                 "store_id": store_id,
@@ -99,8 +101,11 @@ def simulate_day(trading_date: date, withhold_count: int | None = None) -> dict:
             total += price * qty
         if store_id not in withheld_ids:
             close_value = store["close_time_local"]
+            if not isinstance(close_value, clock_time):
+                raise TypeError("close_time_local must be a datetime.time")
             close_dt = datetime.combine(trading_date, close_value).replace(tzinfo=tz)
             eod = {
+                "simulation_id": simulation_id,
                 "store_id": store_id,
                 "trading_date": trading_date.isoformat(),
                 "transaction_count": settings.txn_per_store,
@@ -115,6 +120,7 @@ def simulate_day(trading_date: date, withhold_count: int | None = None) -> dict:
     if remaining:
         raise RuntimeError(f"Kafka producer still has {remaining} undelivered messages")
     return {
+        "simulation_id": simulation_id,
         "trading_date": trading_date.isoformat(),
         "transactions": transaction_messages,
         "eod_markers": eod_messages,
@@ -123,26 +129,25 @@ def simulate_day(trading_date: date, withhold_count: int | None = None) -> dict:
 
 
 def release_eod(trading_date: date) -> dict:
-    stores = _trading_stores(trading_date)
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT (payload->>'store_id')::int AS store_id
-            FROM ingress.kafka_events
-            WHERE topic='pos.store-eod.v1' AND payload->>'trading_date'=%s
-            """,
-            (trading_date.isoformat(),),
-        )
-        existing = {row["store_id"] for row in cur.fetchall()}
+    path = simulation_path(trading_date)
+    simulation = read_json(path)
+    if not simulation:
+        raise RuntimeError(f"No active simulation exists for {trading_date}")
+    simulation_id = str(simulation["simulation_id"])
+    withheld = set(int(value) for value in simulation.get("withheld_store_ids", []))
+    released_already = set(int(value) for value in simulation.get("released_store_ids", []))
+    to_release = sorted(withheld - released_already)
+    stores = {int(row["store_id"]): row for row in trading_stores(trading_date)}
     producer = _producer()
-    released = []
-    for store in stores:
-        store_id = store["store_id"]
-        if store_id in existing:
-            continue
-        tz = ZoneInfo(store["timezone"])
-        close_dt = datetime.combine(trading_date, store["close_time_local"]).replace(tzinfo=tz)
+    for store_id in to_release:
+        store = stores[store_id]
+        tz = ZoneInfo(str(store["timezone"]))
+        close_value = store["close_time_local"]
+        if not isinstance(close_value, clock_time):
+            raise TypeError("close_time_local must be a datetime.time")
+        close_dt = datetime.combine(trading_date, close_value).replace(tzinfo=tz)
         payload = {
+            "simulation_id": simulation_id,
             "store_id": store_id,
             "trading_date": trading_date.isoformat(),
             "transaction_count": settings.txn_per_store,
@@ -151,9 +156,11 @@ def release_eod(trading_date: date) -> dict:
             "eod_ts_utc": close_dt.astimezone(timezone.utc).isoformat(),
         }
         _publish(producer, "pos.store-eod.v1", str(store_id), payload)
-        released.append(store_id)
-    producer.flush(30)
-    return {"released_store_ids": released}
+    if producer.flush(30):
+        raise RuntimeError("One or more released EOD markers were not delivered")
+    simulation["released_store_ids"] = sorted(released_already | set(to_release))
+    write_json(path, simulation)
+    return {"simulation_id": simulation_id, "released_store_ids": to_release}
 
 
 ASN_HEADER = [
@@ -188,27 +195,9 @@ def generate_asn(trading_date: date, line_count: int = 5000, force: bool = False
             row["carton_id"] = f"CTN-{index:07d}"
         writer.writerow(row)
     content = stream.getvalue().encode()
-    name = asn_name(trading_date)
+    name = landing_name(trading_date, "asn_inbound")
     blob.upload_bytes(name, content, "text/csv")
-    host_visible = Path("/workspace/runtime/asn") / name.rsplit("/", 1)[-1]
+    host_visible = settings.runtime_root / "asn" / f"ASN_{trading_date:%Y%m%d}.csv"
     host_visible.parent.mkdir(parents=True, exist_ok=True)
     host_visible.write_bytes(content)
     return {"status": "UPLOADED", "blob": name, "rows": line_count, "schema": variant}
-
-
-def wait_for_ingest(trading_date: date, expected_transactions: int, timeout: int = 120) -> int:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT count(*) AS count FROM ingress.kafka_events
-                WHERE topic='pos.transactions.v1' AND payload->>'trading_date'=%s
-                """,
-                (trading_date.isoformat(),),
-            )
-            count = cur.fetchone()["count"]
-        if count >= expected_transactions:
-            return count
-        time.sleep(1)
-    raise TimeoutError(f"Only {count}/{expected_transactions} transactions reached ingress")

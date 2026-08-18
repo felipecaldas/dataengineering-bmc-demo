@@ -3,27 +3,21 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import date
-
-
-AZURITE_DEFAULT_KEY = (
-    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
-    "K1SZFPTOtr/KBHBeksoGMGw=="
-)
+from pathlib import Path
 
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = os.getenv(
-        "DATABASE_URL", "postgresql://retail:retail@localhost:5432/retail"
-    )
     kafka_bootstrap: str = os.getenv("KAFKA_BOOTSTRAP", "localhost:19092")
-    azure_connection_string: str = os.getenv(
-        "AZURE_STORAGE_CONNECTION_STRING",
-        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
-        f"AccountKey={AZURITE_DEFAULT_KEY};"
-        "BlobEndpoint=http://localhost:10000/devstoreaccount1;",
-    )
+    azure_connection_string: str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+    azure_account: str = os.getenv("AZURE_STORAGE_ACCOUNT", "")
+    azure_key: str = os.getenv("AZURE_STORAGE_KEY", "")
     azure_container: str = os.getenv("AZURE_STORAGE_CONTAINER", "kmart-demo")
+    azure_prefix: str = os.getenv("AZURE_STORAGE_PREFIX", "retail-data-demo").strip("/")
+    databricks_storage_base_path: str = os.getenv(
+        "DATABRICKS_STORAGE_BASE_PATH", ""
+    ).rstrip("/")
+    runtime_root: Path = Path(os.getenv("DEMO_RUNTIME_ROOT", "/workspace/runtime"))
     trading_date: date = date.fromisoformat(
         os.getenv("DEMO_TRADING_DATE", "2026-08-14")
     )
@@ -38,4 +32,3 @@ class Settings:
 
 
 settings = Settings()
-

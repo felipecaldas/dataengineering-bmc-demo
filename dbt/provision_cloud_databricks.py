@@ -273,7 +273,7 @@ def main() -> None:
     }
     CLOUD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     CLOUD_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-    CLOUD_STATE_PATH.chmod(0o600)
+    CLOUD_STATE_PATH.chmod(0o644)
     print(
         f"dbt Cloud Databricks connection {connection_action}; "
         f"development environment {environment_action}; "

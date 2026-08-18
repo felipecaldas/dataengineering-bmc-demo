@@ -2,7 +2,15 @@
 set -euo pipefail
 
 DEMO_ROOT=/home/azureuser/retail-data-demo
-BRANCH=${DBT_CLOUD_CONTROL_M_BRANCH:-demo/dbt-cloud-controlm}
+BRANCH=${DBT_CLOUD_DEPLOYMENT_BRANCH:-}
+if [[ -z "$BRANCH" && -f "$DEMO_ROOT/.env" ]]; then
+  BRANCH=$(awk -F= '$1 == "DBT_CLOUD_DEPLOYMENT_BRANCH" {print substr($0, index($0, "=") + 1)}' "$DEMO_ROOT/.env")
+  BRANCH=${BRANCH%\"}
+  BRANCH=${BRANCH#\"}
+  BRANCH=${BRANCH%\'}
+  BRANCH=${BRANCH#\'}
+fi
+BRANCH=${BRANCH:-demo/dbt-cloud-databricks}
 
 cd "$DEMO_ROOT"
 git fetch --quiet origin
@@ -31,7 +39,7 @@ if ! git -C "$worktree" diff --cached --quiet; then
   git -C "$worktree" \
     -c user.name="Retail Data Demo" \
     -c user.email="retail-data-demo@localhost" \
-    commit --quiet -m "Make retail dbt models portable to Databricks"
+    commit --quiet -m "Publish retail dbt project for Azure Databricks"
 fi
 git -C "$worktree" push --quiet origin "HEAD:refs/heads/$BRANCH"
-echo "dbt project published to origin/$BRANCH"
+echo "Shared dbt project published to origin/$BRANCH"

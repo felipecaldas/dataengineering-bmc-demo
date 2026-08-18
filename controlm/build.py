@@ -34,14 +34,16 @@ def render(
     document = json.loads(source.read_text())
     state = json.loads(cloud_state.read_text())
     job_ids = state.get("job_ids", {})
-    missing = [layer for layer in ("bronze", "silver", "gold") if not job_ids.get(layer)]
+    missing = [
+        layer for layer in ("stage", "intermediate", "gold") if not job_ids.get(layer)
+    ]
     if missing:
         raise RuntimeError(
-            f"dbt Cloud state is missing Control-M job IDs for: {', '.join(missing)}"
+            f"dbt Cloud state is missing shared job IDs for: {', '.join(missing)}"
         )
     replacements = {
-        "${DBT_BRONZE_JOB_ID}": str(job_ids["bronze"]),
-        "${DBT_SILVER_JOB_ID}": str(job_ids["silver"]),
+        "${DBT_STAGE_JOB_ID}": str(job_ids["stage"]),
+        "${DBT_INTERMEDIATE_JOB_ID}": str(job_ids["intermediate"]),
         "${DBT_GOLD_JOB_ID}": str(job_ids["gold"]),
         "${DBT_CONNECTION_PROFILE}": str(
             state.get("controlm_connection_profile", "FMO_AZURE_DBT")

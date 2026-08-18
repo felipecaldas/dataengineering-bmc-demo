@@ -16,12 +16,12 @@ models:
   kmart_retail:
     +materialized: view
     staging:
-      +schema: staging
-      +tags: [bronze]
+      +schema: silver
+      +tags: [stage]
     intermediate:
-      +schema: intermediate
+      +schema: silver
       +materialized: table
-      +tags: [silver]
+      +tags: [intermediate]
     marts:
       +schema: gold
       +materialized: table

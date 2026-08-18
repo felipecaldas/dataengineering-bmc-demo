@@ -6,5 +6,5 @@ select
   stock.on_hand_units,
   stock.on_order_units,
   stock.snapshot_date
-from {{ source('silver', 'stock_on_hand') }} stock
+from {{ source('bronze', 'stock_on_hand') }} stock
 where stock.snapshot_date = cast('{{ var("trading_date") }}' as date)

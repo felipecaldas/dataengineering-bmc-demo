@@ -6,18 +6,23 @@
 # COMMAND ----------
 
 dbutils.widgets.text("trading_date", "2026-08-14")
+dbutils.widgets.text("outbound_path", "")
 trading_date = dbutils.widgets.get("trading_date")
+outbound_path = dbutils.widgets.get("outbound_path").rstrip("/")
+if not outbound_path:
+    raise ValueError("outbound_path is required")
 
 # COMMAND ----------
 
 import csv
 import io
 import json
+import hashlib
 from datetime import date
 
 parsed_date = date.fromisoformat(trading_date)
 date_key = parsed_date.strftime("%Y%m%d")
-destination = f"dbfs:/tmp/retail-data-demo/{date_key}/REPLEN_ORDER_{date_key}.csv"
+destination = f"{outbound_path}/REPLEN_ORDER_{date_key}.csv"
 
 rows = (
     spark.table("gold.fct_replenishment_need")
@@ -43,13 +48,15 @@ for index, row in enumerate(rows, start=1):
         ]
     )
 
-dbutils.fs.put(destination, stream.getvalue(), overwrite=True)
+content = stream.getvalue()
+dbutils.fs.put(destination, content, overwrite=True)
 dbutils.notebook.exit(
     json.dumps(
         {
             "trading_date": trading_date,
             "order_lines": len(rows),
             "destination": destination,
+            "sha256": hashlib.sha256(content.encode()).hexdigest(),
         }
     )
 )

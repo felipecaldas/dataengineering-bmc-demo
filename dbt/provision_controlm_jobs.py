@@ -12,27 +12,32 @@ import provision_cloud_databricks as base
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CLOUD_STATE_PATH = REPOSITORY_ROOT / "runtime" / "dbt_cloud" / "azure.json"
 PROJECT_SUBDIRECTORY = "dbt/kmart_retail"
+DOTENV = base._dotenv_values(REPOSITORY_ROOT / ".env")
+
+
+def _setting(name: str, default: str) -> str:
+    return os.environ.get(name) or DOTENV.get(name, default)
+
+
 DEPLOYMENT_ENVIRONMENT_NAME = os.environ.get(
-    "DBT_CLOUD_CONTROL_M_ENVIRONMENT_NAME", "Azure Databricks Control-M"
+    "DBT_CLOUD_DEPLOYMENT_ENVIRONMENT_NAME"
+) or DOTENV.get(
+    "DBT_CLOUD_DEPLOYMENT_ENVIRONMENT_NAME", "Azure Databricks Shared"
 )
-DEPLOYMENT_BRANCH = os.environ.get(
-    "DBT_CLOUD_CONTROL_M_BRANCH", "demo/dbt-cloud-controlm"
-)
-CONTROL_M_CONNECTION_PROFILE = os.environ.get(
-    "CTM_DBT_CONNECTION_PROFILE", "FMO_AZURE_DBT"
-)
-DEFAULT_TRADING_DATE = os.environ.get("DEMO_TRADING_DATE", "2026-08-14")
+DEPLOYMENT_BRANCH = _setting("DBT_CLOUD_DEPLOYMENT_BRANCH", "demo/dbt-cloud-databricks")
+CONTROL_M_CONNECTION_PROFILE = _setting("CTM_DBT_CONNECTION_PROFILE", "FMO_AZURE_DBT")
+DEFAULT_TRADING_DATE = _setting("DEMO_TRADING_DATE", "2026-08-14")
 JOB_DEFINITIONS = {
-    "bronze": {
-        "name": "Retail Demo Bronze",
-        "description": "Build and test the dbt staging layer on Azure Databricks.",
-        "selector": "tag:bronze",
+    "stage": {
+        "name": "Retail Demo Stage",
+        "description": "Build and test the dbt staging models in Azure Databricks Silver.",
+        "selector": "tag:stage",
         "generate_docs": False,
     },
-    "silver": {
-        "name": "Retail Demo Silver",
-        "description": "Build and test the dbt intermediate layer on Azure Databricks.",
-        "selector": "tag:silver",
+    "intermediate": {
+        "name": "Retail Demo Intermediate",
+        "description": "Build and test the dbt intermediate models in Azure Databricks Silver.",
+        "selector": "tag:intermediate",
         "generate_docs": False,
     },
     "gold": {
@@ -374,9 +379,9 @@ def main() -> None:
         }
     )
     CLOUD_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-    CLOUD_STATE_PATH.chmod(0o600)
+    CLOUD_STATE_PATH.chmod(0o644)
     print(
-        "dbt Cloud Control-M resources ready; "
+        "Shared dbt Cloud resources ready; "
         f"project subdirectory {project_action}; credential {credential_action}; "
         f"deployment environment {environment_action}; jobs {job_actions}."
     )

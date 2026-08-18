@@ -1,372 +1,260 @@
 # AGENTS.md
 
-## Purpose of this file
+## Scope and purpose
 
-This file is the working guide for coding agents and human contributors in this
-repository. It applies to the entire repository. Use it together with the focused
-operator and presentation documents under `docs/`; do not duplicate or silently
-contradict those documents when changing the project.
+This guide applies to the whole repository. Use it with the focused documents in
+`docs/`; update those sources together when behaviour, commands, topology or the
+presentation story changes.
 
-## Project in one paragraph
+## Project summary
 
-This is a self-contained retail DataOps demonstration called **Trade Day Close to
-Store Replenishment**. It simulates a retailer collecting point-of-sale (POS) and
-store end-of-day events, waiting for a supplier advance shipping notice (ASN),
-conforming and testing the data, calculating replenishment orders, delivering an
-order to a warehouse management system (WMS), and observing downstream acceptance.
-The same idempotent data plane is deliberately exposed through two independent
-control planes: Apache Airflow and Control-M. The demo is intended to show where
-the products complement one another, not to prove that one should replace the
-other.
+This is a fictional retail DataOps demonstration named **Trade Day Close to Store
+Replenishment**. It simulates store POS/EOD events and a supplier ASN, ingests the
+source contract into Azure Databricks, builds/tests Silver and Gold with dbt Cloud,
+exports a replenishment order, delivers it to a WMS simulator, and observes
+acceptance.
 
-The retail scenario is industry-informed but fictional. Its thresholds, schedule,
-store estate, operating model, and integration boundaries are demo assumptions;
-they must never be represented as Kmart's actual production process.
+One Azure Databricks/dbt Cloud data plane is exposed through two independent
+control planes:
 
-## What the demo is trying to show
+- Airflow orchestrates readiness through WMS delivery.
+- Control-M orchestrates the same stages and continues through WMS acknowledgement
+  and the 06:00 service SLA.
 
-The central design choice is a **shared data plane with independent control
-planes**:
+The purpose is to show coexistence, not replacement. Do not make Airflow invoke
+Control-M, make Control-M invoke Airflow, or give either path different business
+transformations.
 
-- Airflow shows Python-native data orchestration, provider integrations, two
-  rescheduling sensors, and detailed dbt/Cosmos lineage across ten models.
-- Control-M shows cross-platform operational ownership, native file watches,
-  retry-from-failure behaviour, WMS acknowledgement, and an end-to-end 06:00
-  business-service SLA.
-- Both invoke the same gates and idempotent processing stages. Neither control
-  plane owns the business transformations.
-- The Airflow workflow deliberately ends after the order is delivered to WMS.
-  The Control-M workflow deliberately continues through WMS acknowledgement and
-  SLA measurement. That difference is part of the comparison.
-- The intended conclusion is coexistence: Airflow is strong inside the data
-  engineering domain, while Control-M can govern the wider business service.
+The scenario is industry-informed but fictional. Never represent its estate,
+thresholds, schedule, calendar or operating model as Kmart production facts.
 
-Do not blur this comparison by making Airflow invoke Control-M, Control-M invoke
-Airflow, or by giving either path a different implementation of the data stages.
+## Architecture rules
 
-## Business flow and contracts
+Azure storage and Azure Databricks are the only business-data plane. dbt Cloud
+connects to Databricks. Do not reintroduce PostgreSQL, Azurite, a local Jobs API
+surrogate, a local dbt profile or a bridge that copies business data between local
+and Azure databases.
 
-For a trading date, the logical flow is:
+The local stack contains only source/downstream/control-plane support:
 
-1. Seed reference data and historical sales/stock data.
-2. Publish POS transaction events and per-store EOD markers to Redpanda.
-3. Generate the supplier ASN in Azurite and mirror it to `runtime/asn/` for the
-   Control-M File Watcher.
-4. Converge the store-completeness and ASN-readiness gates.
-5. Run bronze ingestion (Databricks job ID `440`).
-6. Run silver conformance and enforce the ASN schema before changing silver rows
-   (job ID `441`).
-7. Run the ten-model dbt graph and its data tests.
-8. Calculate and export replenishment needs (job ID `447`).
-9. Deliver a deterministic CSV to WMS SFTP.
-10. In the Control-M path, wait for WMS acknowledgement and measure the complete
-    service against the 06:00 pick-wave deadline.
+- Redpanda and Redpanda Console;
+- the Kafka-backed EOD readiness projector;
+- WMS SFTP and acknowledgement writer;
+- Airflow 3.3 standalone; and
+- an on-demand toolbox.
 
-Important business and data contracts:
+Airflow's SQLite named volume is control-plane metadata only. It must never hold
+retail events, medallion data, WMS state or transformation results.
+
+Bronze, Silver and Gold mean physical Azure Databricks schemas/objects:
+
+- `bronze`: six Delta source tables written by `00_ingest_bronze`;
+- `silver`: four dbt staging views and two dbt intermediate tables; and
+- `gold`: four tested dbt marts.
+
+## Business flow
+
+For an explicit trading date:
+
+1. Upload product, stock and 28-day sales-history snapshots to ADLS Gen2.
+2. Publish POS and EOD events to Redpanda and the ASN to ADLS Gen2.
+3. Converge the EOD completeness and ASN arrival gates.
+4. Snapshot the active `simulation_id` Kafka generation and publish a complete
+   six-file Azure manifest.
+5. Run the shared Azure Databricks ingest job and validate the entire contract
+   before writing Bronze.
+6. Run the shared dbt Cloud Stage, Intermediate and Gold jobs.
+7. Run the shared Azure Databricks export job.
+8. Deliver `REPLEN_ORDER_YYYYMMDD.csv` to WMS SFTP.
+9. In Control-M only, wait for `REPLEN_ACK_YYYYMMDD.txt` and measure the 06:00 SLA.
+
+Important contracts:
 
 - The canonical estate is 325 stores across all eight Australian jurisdictions.
-- The default seed has 2,000 products and 28 days of history.
-- A normal day produces 200 POS transactions per store (65,000 total).
-- Store EOD completeness is `PROCEED` at 100%,
-  `PROCEED_WITH_EXCEPTIONS` at or above 99.5% with missing stores,
-  `PROCEED_WITH_TRADE_OPS_ALERT` from 98.0% to below 99.5%, and `HOLD` below
-  98.0%.
-- The ASN header is an exact, ordered contract. Unexpected or missing columns
-  must fail before the silver ASN partition is changed.
-- Stage writes must remain safe to rerun for the same trading date. Preserve the
-  natural keys and date-partition replacement rules documented in
-  `docs/ARCHITECTURE.md`.
-- Export paths and WMS filenames are deterministic and use `YYYYMMDD` in names.
-- Failed gates intentionally exit non-zero. A non-zero result in a failure demo
-  is often the expected result, not necessarily a defect.
+- The default has 2,000 products, 28 days of history and 200 transactions per
+  store (65,000 total on a full day).
+- EOD is `PROCEED` at 100%, `PROCEED_WITH_EXCEPTIONS` at or above 99.5% with
+  missing stores, `PROCEED_WITH_TRADE_OPS_ALERT` from 98.0% to below 99.5%, and
+  `HOLD` below 98.0%.
+- The ASN header is exact and ordered. Header, checksum, count, required-value or
+  date-window failures must occur before the attempted run's first Bronze write.
+- Stage writes are rerunnable for a date. Preserve deterministic whole-snapshot
+  and Delta `replaceWhere` windows.
+- Filenames use `YYYYMMDD`; Python/cloud job variables use `YYYY-MM-DD`.
+- Failed gates intentionally return non-zero.
 
-## Honest boundaries
-
-Maintain these statements in code, docs, and presentations:
-
-- The default stack does **not** connect to Azure Databricks. The
-  `databricks-local` FastAPI service implements the Jobs API interaction needed by
-  the real Airflow Databricks provider, but it is not Spark, Delta Lake, a cluster,
-  or a performance simulation.
-- The checked-in notebooks, job definitions, and empty Azure settings are an
-  adapter/handoff for a future real-Azure profile.
-- Azurite, Redpanda, local Postgres, and the SFTP credentials are demo components
-  and demo-only credentials.
-- `CLOSED_FOR_DEMO` is a demonstration calendar policy, not an authoritative
-  statement about retailer trading restrictions.
-- Schema drift is enforced by an explicit pre-silver contract and dbt tests. Do
-  not claim native Control-M Data Assurance behaviour that is not implemented.
-- Useful Control-M SLA prediction requires successful history in the connected
-  tenant; the JSON definition alone does not create a meaningful forecast.
-- `controlm/descriptors/prod.json` contains placeholders and must not be deployed
-  as-is.
-
-## Architecture
-
-`docker-compose.yml` is the single master application definition. The default
-stack contains:
-
-- `redpanda` and `redpanda-console` for Kafka-compatible event transport and
-  inspection;
-- `azurite` for the Azure Blob-compatible file boundary;
-- `postgres` for ingress, bronze, silver, dbt schemas, and run metadata;
-- `kafka-ingest` for continuous idempotent landing of Kafka events;
-- `databricks-local` for independently triggerable Jobs API-compatible stages;
-- `wms-sftp` and `wms-ack-writer` for delivery and configurable acceptance;
-- Airflow 3.3 API server, scheduler, DAG processor, and triggerer services; and
-- a `toolbox` image containing the Python operator CLI and dbt.
-
-The enrolled Control-M Agent is intentionally outside Compose because its identity
-belongs to the host and connected SaaS tenant. Its jobs enter the application only
-through `controlm/scripts/run_stage.sh`. Do not copy Agent credentials into this
-repository or a container image.
-
-The generators and processing stages contain no orchestration decisions. The
-continuous Kafka ingress and WMS acknowledgement writer observe their own inputs
-but never schedule the next pipeline stage.
-
-## Repository map and sources of truth
+## Sources of truth
 
 | Path | Responsibility |
 |---|---|
-| `README.md` | Project overview, quick start, comparison, and public boundaries |
-| `docs/ARCHITECTURE.md` | Component boundaries and idempotency rules |
-| `docs/OPERATIONS.md` | Startup, access, connection details, and safe shutdown |
-| `docs/RUNSHEET.md` | Canonical presentation sequence and talking points |
-| `demo_design.md` | Original design intent; some implementation choices were superseded by the self-contained profile |
-| `_demo_explainer.md` | Supporting narrative/explanation, not executable configuration |
-| `docker-compose.yml` | Master local topology, pinned service versions, ports, and environment wiring |
-| `Makefile` | Canonical operator and developer command interface |
-| `demo/` | Python CLI, generators, gates, stages, WMS adapter, failures, and Jobs API surrogate |
-| `infra/postgres/init.sql` | Initial schemas and persistent table contracts |
-| `airflow/dags/` | Control plane A orchestration only |
-| `dbt/kmart_retail/` | Staging, intermediate, marts, macros, tests, and Postgres profile |
-| `controlm/workflows/` | Control plane B workflow-as-code source |
-| `controlm/descriptors/` | Environment-specific Control-M substitutions |
-| `controlm/scripts/` | Host-Agent entry points into Compose |
-| `databricks/` | Optional real-Databricks notebooks and job definitions |
-| `generators/` | Thin standalone generator entry points |
-| `failures/` | Reversible scenario wrappers and the canonical reset operation |
+| `README.md` | Overview, quick start and honest boundaries |
+| `docs/ARCHITECTURE.md` | As-built component/data boundaries and rerun rules |
+| `docs/OPERATIONS.md` | Provisioning, startup, commands and recovery |
+| `docs/RUNSHEET.md` | Canonical comparison/presentation sequence |
+| `docs/ARCHITECTURE_DATABRICKS_TARGET.md` | Decision record for removing PostgreSQL |
+| `docker-compose.yml` | Local simulation/control-plane topology |
+| `Makefile` | Canonical operator command surface |
+| `demo/` | Generators, readiness, landing, gates, WMS and failure logic |
+| `databricks/` | Cluster/job provisioning and the two notebooks |
+| `dbt/kmart_retail/` | Databricks dbt project |
+| `dbt/*.py` | dbt Cloud provisioning/manual run adapters |
+| `airflow/dags/` | Control Plane A only |
+| `controlm/` | Control Plane B workflow and host adapters |
 | `tests/` | Fast local contract tests |
-| `runtime/` | Generated presentation files and state; ignored except for `.gitkeep` |
+| `runtime/` | Ignored generated IDs, modes, snapshots and watcher files |
 
-When documentation disagrees with executable behaviour, first determine whether
-the code or docs changed intentionally. `README.md` explicitly records where the
-self-contained implementation supersedes the original `demo_design.md`. Update all
-affected sources in the same change instead of leaving a new discrepancy.
+`demo_design.md` is historical intent and may describe superseded implementation
+choices. Executable behaviour plus the three focused docs above are authoritative.
 
-## Environment and prerequisites
+## Environment and commands
 
-- Use Docker Engine with Compose v2 and allocate at least 4 GB of memory.
-- Python code and images target Python 3.12.
-- Copy `.env.example` to `.env` through `make prepare`; do not commit `.env`.
-- The standard presentation date is `2026-08-14`. Most Make targets accept
-  `DATE=YYYY-MM-DD`; always pass the date explicitly in reproducible examples.
-- Run application commands through Make and the toolbox container unless a task
-  specifically concerns host integration.
-- The Control-M commands require the host CLI, a configured environment, and an
-  enrolled/running Agent. A normal local contributor may not have those.
+Use Docker Compose v2, Python 3.12 and at least 4 GB of Docker memory. Run
+`make prepare`, then put Azure/Databricks/dbt Cloud secrets only in ignored `.env`
+or the platforms' authentication stores.
 
-Treat `.env`, generated Airflow credentials, Control-M CLI configuration, and any
-future Azure values as secrets even though the checked-in defaults are isolated
-demo credentials. Never print, copy, or commit credentials discovered on the host.
-
-## Important commands
-
-Start with `make help`; the Makefile is the canonical command interface.
-
-### Prepare and operate the stack
+Start with `make help`. Common local operations are:
 
 ```bash
 make prepare
 make up
 make health
+make controlm-health
 make ps
 make logs
 make down
 ```
 
-For a cold presentation environment:
+The shared manual data chain is:
 
 ```bash
-make demo-ready DATE=2026-08-14
-```
-
-`make down` retains named-volume data. `make clean` removes containers **and all
-named data volumes** and is destructive.
-
-### Prepare and run the shared data plane
-
-```bash
-make seed
+make seed DATE=2026-08-14
+make eod-readiness-arm DATE=2026-08-14
 make simulate DATE=2026-08-14
-make gate-eod DATE=2026-08-14
-make gate-asn DATE=2026-08-14
-make bronze DATE=2026-08-14
-make silver DATE=2026-08-14
-make dbt DATE=2026-08-14
-make replen DATE=2026-08-14
+make stage-inputs DATE=2026-08-14
+make databricks-ingest DATE=2026-08-14
+make dbt-stage DATE=2026-08-14
+make dbt-intermediate DATE=2026-08-14
+make dbt-gold DATE=2026-08-14
+make databricks-export DATE=2026-08-14
 make deliver DATE=2026-08-14
-make gate-ack DATE=2026-08-14
 ```
 
-Running this chain manually is the proof that the data plane is independent of
-both orchestrators.
+Run the control planes with `make demo-airflow` and `make demo-controlm`. Do not
+run them concurrently for the same date.
 
-### Run the control planes
+Cloud provisioning is explicit and externally mutating:
 
 ```bash
-make run-airflow DATE=2026-08-14
+make databricks-provision
+make dbt-cloud-publish
+make dbt-cloud-provision
+```
+
+Control-M deployment and ordering are also external changes:
+
+```bash
 make controlm-build
 make controlm-deploy
 make run-controlm DATE=2026-08-14
 ```
 
-`make controlm-build` validates/compiles against the configured development
-environment. `make controlm-deploy` changes the connected Control-M tenant, and
-`make run-controlm` orders live work there. Deployment or ordering requires
-explicit intent; do not use either as an incidental validation step.
+Do not perform provisioning, publishing, deployment, ordering,
+`make seed-sla-history`, `make controlm-service` or destructive `make clean` as an
+incidental validation step.
 
-`make controlm-service` uses sudo and changes a host systemd service. It is a
-one-time host operation, not a normal development command.
+## Development rules
 
-### Inject and reverse failures
+1. Preserve a single shared data plane. Put reusable logic in `demo/`, Databricks
+   notebooks or dbt, and keep orchestrator files as adapters.
+2. Maintain both Airflow and Control-M when a shared job name, job-state key,
+   command, path, variable or contract changes.
+3. Preserve rerun safety. Every write needs a whole-snapshot replacement,
+   deterministic date window or stable key.
+4. Thread the trading date explicitly. Do not confuse replay date with the live
+   Control-M order date used by the SLA.
+5. Preserve `simulation_id` filtering and bounded Kafka snapshots; old immutable
+   topic records must not contaminate a replay.
+6. Publish the landing manifest last and validate every input before the first
+   Bronze write.
+7. Keep generators and notebooks free of scheduling, downstream dependency and
+   retry decisions.
+8. Keep Airflow ending at delivery and Control-M continuing through ACK/SLA unless
+   the comparison itself is deliberately redesigned and documented.
+9. Keep shell scripts in strict mode, quote expansions and validate dates at host
+   boundaries.
+10. Keep JSON deterministic and valid. Workflow source belongs under
+    `controlm/workflows/`; generated substitutions belong under ignored `runtime/`.
+11. Use pinned dependencies and update claims when versions change.
+12. Prefer existing Make targets over undocumented raw commands; update `make
+    help` descriptions for new operator actions.
+13. Do not hand-edit generated `runtime/`, Airflow logs/config, or dbt target/logs.
+14. Preserve unrelated user changes in a dirty worktree.
+15. Update all affected docs when topology, commands, behaviour, thresholds or the
+    presentation story changes.
 
-```bash
-make fail-1 STORES=1 DATE=2026-08-14
-make fail-1 STORES=8 DATE=2026-08-14
-make fail-2 DATE=2026-08-14
-make fail-3 DATE=2026-08-14
-make fail-4 ROWS=400 DATE=2026-08-14
-make fail-5 SECONDS=45
-make reset DATE=2026-08-14
-```
+## Validation
 
-WMS outcomes are controlled independently with `make wms-ack`,
-`make wms-never-ack`, `make wms-late`, and `make wms-reject`. Always run
-`make reset DATE=...` after a failure exercise. Reset is designed to restore
-snapshotted stock, normal modes, standard inputs, conformed data, and date-scoped
-acknowledgements.
-
-### Validate changes
+Always run:
 
 ```bash
 make lint
 make test
 ```
 
-`make lint` compiles Python, validates the Control-M workflow JSON, validates the
-Compose model, and checks shell syntax. `make test` includes lint and runs the
-contract suite inside the toolbox image. The toolbox image is normally built by
-`make up`; prepare the stack first if it is not present.
+Use proportionate integration checks:
 
-Use proportionate integration checks in addition to those fast checks:
+- source/gate changes: extend `tests/test_demo_contracts.py`, run the affected
+  local simulation and prove reset;
+- Compose/image changes: run `make up` and `make health` after lint;
+- landing/notebook changes: stage the same date twice, run ingest twice and verify
+  deterministic counts/windows in Databricks;
+- dbt changes: publish/provision only with explicit authority, then run the three
+  jobs and inspect tests/artifacts;
+- Airflow changes: verify DAG import and one complete manual run;
+- Control-M changes: use `make controlm-build`; deployment is not validation;
+- failure changes: prove the failure and a successful `make reset`.
 
-- Python gate, naming, or seed changes: extend `tests/test_demo_contracts.py` and
-  run `make test`.
-- Compose or image changes: run `make lint`, `make up`, and `make health`.
-- Stage/schema changes: prepare a date, run the affected upstream and downstream
-  stages, rerun them to prove idempotency, then run `make reset` and `make health`.
-- dbt changes: run `make dbt DATE=...` against prepared data and inspect both model
-  results and tests.
-- Airflow changes: verify the DAG loads in Airflow and complete a manual run.
-- Control-M workflow changes: run `make controlm-build` when the authenticated CLI
-  is available. Do not substitute deployment for validation.
-- Failure changes: prove both the intended failing state and a successful reset.
+Local lint/tests must not contact or mutate Azure Databricks, dbt Cloud or
+Control-M.
 
-## Development rules for agents
+## Secrets and generated state
 
-1. Preserve data-plane independence. Put reusable business logic in `demo/` or
-   dbt, and keep Airflow/Control-M files as orchestration adapters.
-2. Preserve rerun safety. New writes need a deterministic natural key, an upsert,
-   or an explicit trading-date replacement rule. Test the same date twice.
-3. Thread the trading date explicitly through commands and templates. Python uses
-   `YYYY-MM-DD`; Control-M filenames and `%%DEMO_DATE` use `YYYYMMDD`. Do not confuse
-   the replay data date with Control-M's live order/business date used by the SLA.
-4. Keep gates observable and policy-oriented. Log/emit expected counts, actual
-   counts, decisions, missing inputs, and useful failure reasons.
-5. Validate schemas before destructive partition operations. The ASN contract must
-   fail before silver data for that date is deleted or replaced.
-6. Keep stage-run metadata accurate. Work wrapped by `stage_run` must finish as
-   `SUCCESS` or `FAILED` with useful row counts/messages.
-7. Maintain both orchestration adapters when a shared stage name, command, job ID,
-   path, or contract changes.
-8. Use pinned dependencies and image versions deliberately. If a version changes,
-   update the relevant requirements/Docker/Compose files and the claims in the
-   README where necessary.
-9. Prefer existing Make targets over undocumented raw container commands. Add or
-   update `make help` descriptions when introducing operator actions.
-10. Keep shell scripts in strict mode (`set -euo pipefail`), quote expansions, and
-    retain explicit date validation at host/container boundaries.
-11. Keep JSON files valid and deterministic. Control-M workflow source belongs in
-    `controlm/workflows/`; environment substitutions belong in descriptors or
-    `controlm/build.py`.
-12. Do not hand-edit generated content in `runtime/`, `airflow/logs/`,
-    `airflow/config/`, or dbt `target/`/`logs/`.
-13. Preserve unrelated user changes in a dirty worktree. Never reset generated or
-    persistent demo state unless the requested task requires it.
-14. Update documentation when behaviour, commands, ports, demo claims, thresholds,
-    topology, or presentation steps change.
+Treat `.env`, `.databrickscfg`, Airflow credentials, dbt Cloud tokens and
+Control-M configuration as secrets. Never print, copy or commit them.
 
-## Database and migration caution
+`runtime/databricks/azure.json` and `runtime/dbt_cloud/azure.json` contain only
+non-secret generated IDs, are container-readable and are ignored. The Databricks storage key is stored in
+a Databricks secret scope and referenced from cluster Spark configuration. Do not
+put it directly in notebook code or job JSON.
 
-`infra/postgres/init.sql` only runs when the Postgres volume is first initialized.
-Editing it does not migrate an existing named volume. For schema evolution, make
-the intended fresh-install behaviour explicit and either add an idempotent runtime
-migration path or document that a deliberate `make clean` is required. Never run
-`make clean` automatically just to make a schema edit appear to work.
+## Destructive and external actions
 
-The schemas have distinct roles:
-
-- `ingress`: immutable/idempotent event landing;
-- `bronze`: raw typed inputs plus raw ASN header/rows;
-- `silver`: conformed business inputs and seeded reference/history data;
-- `staging` and `intermediate`: dbt transformation layers;
-- `gold`: business-facing stock, velocity, product, and replenishment models;
-- `meta`: demo modes, pipeline-run audit, and WMS-delivery state.
-
-## External and destructive actions
-
-Agents must distinguish local, reversible demo work from external or destructive
-operations:
-
+- `make clean` deletes local named volumes permanently.
 - `make controlm-deploy` mutates the connected SaaS tenant.
-- `make run-controlm` orders external work in that tenant.
-- `make seed-sla-history` orders many Control-M runs.
-- `make controlm-service` changes the host service and requires sudo.
-- `make clean` permanently deletes the local Compose volumes.
-- `make reset` intentionally mutates demo data for one date, but is the normal,
-  reversible recovery mechanism after failure injection.
+- `make run-controlm` and `make seed-sla-history` order live work.
+- `make controlm-service` changes a host systemd service with sudo.
+- `make databricks-provision` creates/updates billable Azure resources and a
+  secret.
+- `make dbt-cloud-publish` pushes a deployment branch.
+- `make dbt-cloud-provision` creates/updates dbt Cloud resources.
+- `make reset` mutates one date's demo input/output state but is the normal,
+  reversible recovery operation.
 
-Do not perform the first five operations merely to inspect, lint, or diagnose a
-change. Use read-only configuration inspection, `make lint`, and
-`make controlm-build` where appropriate.
+## Honest boundaries
 
-## Common pitfalls
-
-- A healthy local Jobs API does not mean Azure Databricks is configured.
-- `runtime/` mirrors files for host-side Control-M File Watchers; Azurite remains
-  the application file store. Keep both sides aligned when changing file naming.
-- Airflow's deliberate omission of WMS acknowledgement and SLA is not unfinished
-  work.
-- Control-M's host paths currently assume
-  `/home/azureuser/retail-data-demo`. A portability change must update the workflow,
-  wrapper scripts, service definition, documentation, and deployment assumptions
-  together.
-- The Airflow admin password is generated under ignored local state. Never put it
-  in docs or source.
-- `make fail-4` depends on its snapshot for recovery. Do not overwrite or bypass
-  the failure/reset pairing.
-- dbt retry markers under `runtime/` are date-scoped and are part of Control-M's
-  retry-from-point-of-failure story.
-- Avoid changing the default Airflow schedule from manual unless the environment
-  is deliberately prepared; an automatic schedule can start against stale or
-  unseeded data.
+- Redpanda sources and WMS are simulations; Databricks and dbt Cloud are real.
+- Airflow standalone/SQLite is for this one-user demo, not production guidance.
+- The small Databricks cluster is not a performance simulation.
+- `CLOSED_FOR_DEMO` and all retail policy are fictional demonstration choices.
+- Schema drift uses an explicit source contract and dbt tests; do not claim an
+  unimplemented native Control-M Data Assurance feature.
+- Useful SLA forecasting needs successful history in the connected tenant.
+- `controlm/descriptors/prod.json` contains placeholders and must not be deployed
+  as-is.
 
 ## Definition of done
 
-A change is complete when the relevant code, tests, orchestration adapters, and
-documentation agree; `make lint` and the applicable tests pass; rerun and reset
-behaviour remain safe; generated files and secrets are not committed; and the demo
-still tells an accurate story about a shared idempotent data plane, Airflow's data
-engineering strengths, and Control-M's end-to-end service ownership.
+A change is complete when code, notebooks, dbt, both orchestration adapters,
+tests, Make commands and documentation agree; applicable local validation passes;
+rerun/reset behaviour remains safe; no secret/generated state is committed; and
+the demo still tells an accurate shared-data-plane/coexistence story.

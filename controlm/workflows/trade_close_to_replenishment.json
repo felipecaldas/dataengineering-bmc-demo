@@ -52,55 +52,48 @@
       "MinimumSize": "10B",
       "Description": "Supplier ASN non-arrival is visible as a distinct upstream failure"
     },
-    "LandKafkaEvents": {
+    "StageInputsToAzure": {
       "Type": "Job:Command",
       "Host": "fmo-azureuser",
       "RunAs": "azureuser",
-      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh bronze %%DEMO_DATE",
-      "Description": "Idempotently land Kafka POS and EOD events plus the supplier ASN in the local source plane"
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh stage-inputs %%DEMO_DATE",
+      "Description": "Snapshot the active Kafka generation and six-source manifest into Azure storage"
     },
-    "ValidateSourceContract": {
+    "IngestBronze": {
       "Type": "Job:Command",
       "Host": "fmo-azureuser",
       "RunAs": "azureuser",
-      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh silver %%DEMO_DATE",
-      "Description": "Enforce the ASN schema contract before promoting the six validated source tables"
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh ingest %%DEMO_DATE",
+      "Description": "Run the shared Azure Databricks job that validates the complete manifest and writes Bronze Delta tables"
     },
-    "SyncDeltaSources": {
-      "Type": "Job:Command",
-      "Host": "fmo-azureuser",
-      "RunAs": "azureuser",
-      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh azure-sync %%DEMO_DATE",
-      "Description": "Copy one validated, date-scoped source snapshot into Azure Databricks Delta"
-    },
-    "DbtBronze": {
+    "DbtStage": {
       "Type": "Job:DBT",
       "Host": "fmo-azureuser",
       "RunAs": "azureuser",
       "ConnectionProfile": "${DBT_CONNECTION_PROFILE}",
-      "DBT Job Id": "${DBT_BRONZE_JOB_ID}",
-      "Run Comment": "Control-M retail demo bronze for %%DEMO_ISO_DATE",
+      "DBT Job Id": "${DBT_STAGE_JOB_ID}",
+      "Run Comment": "Control-M retail demo staging for %%DEMO_ISO_DATE",
       "Override Job Commands": "checked",
       "Variables": [
         {
-          "UCM-DefineCommands-N001-element": "dbt build --select tag:bronze --vars '{trading_date: %%DEMO_ISO_DATE}'"
+          "UCM-DefineCommands-N001-element": "dbt build --select tag:stage --vars '{trading_date: %%DEMO_ISO_DATE}'"
         }
       ],
       "Status Polling Frequency": "10",
       "Failure Tolerance": "2",
-      "Description": "Native dbt plug-in job: build and test the staging views presented as the Azure bronze layer"
+      "Description": "Native dbt plug-in job: build and test staging views in the Azure Databricks Silver layer"
     },
-    "DbtSilver": {
+    "DbtIntermediate": {
       "Type": "Job:DBT",
       "Host": "fmo-azureuser",
       "RunAs": "azureuser",
       "ConnectionProfile": "${DBT_CONNECTION_PROFILE}",
-      "DBT Job Id": "${DBT_SILVER_JOB_ID}",
-      "Run Comment": "Control-M retail demo silver for %%DEMO_ISO_DATE",
+      "DBT Job Id": "${DBT_INTERMEDIATE_JOB_ID}",
+      "Run Comment": "Control-M retail demo intermediate for %%DEMO_ISO_DATE",
       "Override Job Commands": "checked",
       "Variables": [
         {
-          "UCM-DefineCommands-N001-element": "dbt build --select tag:silver --vars '{trading_date: %%DEMO_ISO_DATE}'"
+          "UCM-DefineCommands-N001-element": "dbt build --select tag:intermediate --vars '{trading_date: %%DEMO_ISO_DATE}'"
         }
       ],
       "Status Polling Frequency": "10",
@@ -136,11 +129,11 @@
         }
       }
     },
-    "ExportAzureOrder": {
+    "ExportReplenishment": {
       "Type": "Job:Command",
       "Host": "fmo-azureuser",
       "RunAs": "azureuser",
-      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh azure-replen %%DEMO_DATE",
+      "Command": "/home/azureuser/retail-data-demo/controlm/scripts/run_stage.sh export %%DEMO_DATE",
       "Description": "Export the tested Azure gold result into the deterministic WMS CSV contract"
     },
     "DeliverToWMS": {
@@ -184,22 +177,21 @@
     },
     "EodToLanding": {
       "Type": "Flow",
-      "Sequence": ["WaitForStoreEODThreshold", "LandKafkaEvents"]
+      "Sequence": ["WaitForStoreEODThreshold", "StageInputsToAzure"]
     },
     "AsnToLanding": {
       "Type": "Flow",
-      "Sequence": ["WaitSupplierASN", "LandKafkaEvents"]
+      "Sequence": ["WaitSupplierASN", "StageInputsToAzure"]
     },
     "ProcessingFlow": {
       "Type": "Flow",
       "Sequence": [
-        "LandKafkaEvents",
-        "ValidateSourceContract",
-        "SyncDeltaSources",
-        "DbtBronze",
-        "DbtSilver",
+        "StageInputsToAzure",
+        "IngestBronze",
+        "DbtStage",
+        "DbtIntermediate",
         "DbtGold",
-        "ExportAzureOrder",
+        "ExportReplenishment",
         "DeliverToWMS",
         "ConfirmWMSIntake",
         "SLA_PickWave"

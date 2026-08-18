@@ -1,8 +1,8 @@
 version: 2
 
 sources:
-  - name: silver
-    schema: silver
+  - name: bronze
+    schema: bronze
     tables:
       - name: pos_transactions
       - name: store_eod
@@ -10,4 +10,3 @@ sources:
       - name: product_master
       - name: stock_on_hand
       - name: sales_history
-

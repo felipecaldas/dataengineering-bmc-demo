@@ -1,7 +1,8 @@
-"""Control plane A: Airflow-only orchestration of the retail data plane."""
+"""Control plane A over the shared Azure Databricks and dbt Cloud data plane."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import timedelta
@@ -9,20 +10,38 @@ from pathlib import Path
 
 import pendulum
 from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.standard.sensors.python import PythonSensor
 from airflow.sdk import DAG
-from cosmos import DbtTaskGroup, ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
-from cosmos.constants import ExecutionMode, LoadMode, TestBehavior
 
 from demo.gates import asn_ready, eod_status
+from demo.landing import stage_inputs
 from demo.wms import deliver_to_wms
 
 
 LOGGER = logging.getLogger(__name__)
-DBT_PROJECT = Path("/opt/airflow/dbt/kmart_retail")
+RUNTIME_ROOT = Path(os.getenv("DEMO_RUNTIME_ROOT", "/opt/airflow/runtime"))
 TRADING_DATE = "{{ dag_run.conf.get('trading_date', ds) }}"
 DEMO_SCHEDULE = os.getenv("DEMO_AIRFLOW_SCHEDULE") or None
+STORAGE_BASE = os.environ.get("DATABRICKS_STORAGE_BASE_PATH", "").rstrip("/")
+
+
+def _job_ids(relative_path: str, required: tuple[str, ...]) -> dict[str, int]:
+    path = RUNTIME_ROOT / relative_path
+    try:
+        state = json.loads(path.read_text())
+        values = state["job_ids"]
+        return {key: int(values[key]) for key in required}
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        LOGGER.warning("Generated job state is incomplete: %s", path)
+        return {key: 0 for key in required}
+
+
+DATABRICKS_JOBS = _job_ids("databricks/azure.json", ("ingest", "export"))
+DBT_CLOUD_JOBS = _job_ids(
+    "dbt_cloud/azure.json", ("stage", "intermediate", "gold")
+)
 
 
 def eod_gate(trading_date: str) -> bool:
@@ -44,30 +63,58 @@ def asn_gate(trading_date: str) -> bool:
     return ready
 
 
+def stage_azure_inputs(trading_date: str) -> dict:
+    return stage_inputs(pendulum.parse(trading_date).date())
+
+
 def wms_delivery(trading_date: str) -> dict:
     return deliver_to_wms(pendulum.parse(trading_date).date())
 
 
-profile_config = ProfileConfig(
-    profile_name="kmart_retail",
-    target_name="demo",
-    profiles_yml_filepath=DBT_PROJECT / "profiles.yml",
-)
+def dbt_step(tag: str) -> str:
+    return (
+        f"dbt build --select tag:{tag} "
+        f'--vars "{{trading_date: \'{TRADING_DATE}\'}}"'
+    )
+
+
+def validate_cloud_configuration() -> dict:
+    missing = []
+    if not STORAGE_BASE:
+        missing.append("DATABRICKS_STORAGE_BASE_PATH")
+    missing.extend(
+        f"Databricks job:{key}" for key, value in DATABRICKS_JOBS.items() if value <= 0
+    )
+    missing.extend(
+        f"dbt Cloud job:{key}" for key, value in DBT_CLOUD_JOBS.items() if value <= 0
+    )
+    if missing:
+        raise RuntimeError(
+            "Cloud job configuration is incomplete; provision jobs and restart Airflow: "
+            + ", ".join(missing)
+        )
+    return {
+        "databricks_jobs": DATABRICKS_JOBS,
+        "dbt_cloud_jobs": DBT_CLOUD_JOBS,
+        "storage_base": STORAGE_BASE,
+    }
 
 
 with DAG(
     dag_id="trade_close_to_replenishment",
-    description="Trade day close to WMS replenishment — Airflow control plane",
+    description="Trade day close to WMS delivery through Azure Databricks and dbt Cloud",
     start_date=pendulum.datetime(2026, 1, 1, tz="Australia/Melbourne"),
-    # Manual by default so a freshly started presentation stack cannot order a
-    # stale trading date before it has been seeded. Set DEMO_AIRFLOW_SCHEDULE to
-    # "0 1 * * *" to demonstrate the production daily schedule from the design.
     schedule=DEMO_SCHEDULE,
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
-    tags=["retail", "dataops", "control-plane-a"],
+    tags=["retail", "dataops", "control-plane-a", "azure-databricks", "dbt-cloud"],
 ) as dag:
+    configuration = PythonOperator(
+        task_id="validate_cloud_configuration",
+        python_callable=validate_cloud_configuration,
+    )
+
     wait_for_stores = PythonSensor(
         task_id="wait_for_store_eod_threshold",
         python_callable=eod_gate,
@@ -86,46 +133,62 @@ with DAG(
         mode="reschedule",
     )
 
-    bronze = DatabricksRunNowOperator(
-        task_id="databricks_bronze_ingest",
-        databricks_conn_id="databricks_default",
-        job_id=440,
-        job_parameters={"trading_date": TRADING_DATE},
-        idempotency_token="airflow-bronze-{{ run_id }}",
-        polling_period_seconds=1,
+    stage = PythonOperator(
+        task_id="stage_inputs_to_azure",
+        python_callable=stage_azure_inputs,
+        op_kwargs={"trading_date": TRADING_DATE},
     )
 
-    silver = DatabricksRunNowOperator(
-        task_id="databricks_silver_conform",
+    ingest = DatabricksRunNowOperator(
+        task_id="databricks_ingest_bronze",
         databricks_conn_id="databricks_default",
-        job_id=441,
-        job_parameters={"trading_date": TRADING_DATE},
-        idempotency_token="airflow-silver-{{ run_id }}",
-        polling_period_seconds=1,
+        job_id=DATABRICKS_JOBS["ingest"],
+        job_parameters={
+            "trading_date": TRADING_DATE,
+            "landing_path": f"{STORAGE_BASE}/landing/trading_date={TRADING_DATE}",
+        },
+        idempotency_token="airflow-ingest-{{ run_id }}",
+        polling_period_seconds=10,
     )
 
-    dbt_gold = DbtTaskGroup(
-        group_id="dbt_gold",
-        project_config=ProjectConfig(dbt_project_path=DBT_PROJECT),
-        profile_config=profile_config,
-        execution_config=ExecutionConfig(
-            execution_mode=ExecutionMode.LOCAL,
-            dbt_executable_path="/home/airflow/.local/bin/dbt",
-        ),
-        render_config=RenderConfig(
-            load_method=LoadMode.DBT_LS,
-            test_behavior=TestBehavior.AFTER_EACH,
-        ),
-        operator_args={"vars": {"trading_date": TRADING_DATE}},
+    dbt_stage = DbtCloudRunJobOperator(
+        task_id="dbt_stage",
+        dbt_cloud_conn_id="dbt_cloud_default",
+        job_id=DBT_CLOUD_JOBS["stage"],
+        trigger_reason=f"Airflow retail demo stage for {TRADING_DATE}",
+        steps_override=[dbt_step("stage")],
+        check_interval=10,
+        timeout=3600,
+    )
+    dbt_intermediate = DbtCloudRunJobOperator(
+        task_id="dbt_intermediate",
+        dbt_cloud_conn_id="dbt_cloud_default",
+        job_id=DBT_CLOUD_JOBS["intermediate"],
+        trigger_reason=f"Airflow retail demo intermediate for {TRADING_DATE}",
+        steps_override=[dbt_step("intermediate")],
+        check_interval=10,
+        timeout=3600,
+    )
+    dbt_gold = DbtCloudRunJobOperator(
+        task_id="dbt_gold",
+        dbt_cloud_conn_id="dbt_cloud_default",
+        job_id=DBT_CLOUD_JOBS["gold"],
+        trigger_reason=f"Airflow retail demo gold for {TRADING_DATE}",
+        steps_override=[dbt_step("gold")],
+        check_interval=10,
+        timeout=3600,
     )
 
-    replenishment = DatabricksRunNowOperator(
-        task_id="databricks_replenishment_calc",
+    export = DatabricksRunNowOperator(
+        task_id="databricks_export_replenishment",
         databricks_conn_id="databricks_default",
-        job_id=447,
-        job_parameters={"trading_date": TRADING_DATE},
-        idempotency_token="airflow-replen-{{ run_id }}",
-        polling_period_seconds=1,
+        job_id=DATABRICKS_JOBS["export"],
+        job_parameters={
+            "trading_date": TRADING_DATE,
+            "outbound_path": f"{STORAGE_BASE}/outbound",
+        },
+        idempotency_token="airflow-export-{{ run_id }}",
+        polling_period_seconds=10,
     )
 
     deliver = PythonOperator(
@@ -134,8 +197,9 @@ with DAG(
         op_kwargs={"trading_date": TRADING_DATE},
     )
 
-    [wait_for_stores, wait_for_asn] >> bronze >> silver >> dbt_gold >> replenishment >> deliver
+    configuration >> [wait_for_stores, wait_for_asn]
+    [wait_for_stores, wait_for_asn] >> stage
+    stage >> ingest >> dbt_stage >> dbt_intermediate >> dbt_gold >> export >> deliver
 
-# Intentionally absent from Control Plane A:
-# - WMS acknowledgement monitoring
-# - the 06:00 pick-wave SLA service definition and forecast
+# Deliberate Control Plane A boundary: acknowledgement and 06:00 service-SLA
+# measurement remain in Control-M, after the same WMS delivery boundary.

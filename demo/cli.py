@@ -3,24 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import socket
-import sys
 import time
 from datetime import date
-from typing import Any, Callable
+from typing import Any
 
-import httpx
 from confluent_kafka.admin import AdminClient
 
 from demo import blob
 from demo.config import settings
-from demo.databricks_export import export_silver
-from demo.databricks_order import import_databricks_order
-from demo.db import connect, set_config
 from demo.failures import late_stores, no_asn, phantom_stock, reset, schema_drift, slow_cluster
 from demo.gates import ack_name, asn_ready, eod_status
+from demo.landing import stage_inputs
 from demo.seed import seed_history, seed_reference
-from demo.simulate import generate_asn, release_eod, simulate_day, wait_for_ingest
-from demo.stages import bronze_ingest, replenishment_calc, silver_conform
+from demo.simulate import generate_asn, release_eod, simulate_day
+from demo.state import set_config
 from demo.wms import ack_exists, deliver_to_wms
 
 
@@ -35,14 +31,12 @@ def parsed_date(value: str | None) -> date:
 def cmd_health(_: argparse.Namespace) -> None:
     result: dict[str, dict[str, Any]] = {}
     try:
-        with connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1 AS ok")
-            result["postgres"] = {"healthy": cur.fetchone()["ok"] == 1}
-    except Exception as exc:
-        result["postgres"] = {"healthy": False, "message": str(exc)}
-    try:
         metadata = AdminClient({"bootstrap.servers": settings.kafka_bootstrap}).list_topics(timeout=5)
-        required = {"pos.transactions.v1", "pos.store-eod.v1"}
+        required = {
+            "pos.transactions.v1",
+            "pos.store-eod.v1",
+            "retail.store-eod-readiness.v1",
+        }
         result["kafka"] = {
             "healthy": required.issubset(metadata.topics),
             "topics": sorted(required.intersection(metadata.topics)),
@@ -51,15 +45,13 @@ def cmd_health(_: argparse.Namespace) -> None:
         result["kafka"] = {"healthy": False, "message": str(exc)}
     try:
         blob.init_container()
-        result["azurite"] = {"healthy": True, "container": settings.azure_container}
+        result["azure_storage"] = {
+            "healthy": True,
+            "container": settings.azure_container,
+            "prefix": settings.azure_prefix,
+        }
     except Exception as exc:
-        result["azurite"] = {"healthy": False, "message": str(exc)}
-    try:
-        response = httpx.get("http://databricks-local:8000/health", timeout=5)
-        response.raise_for_status()
-        result["databricks_local"] = {"healthy": True, **response.json()}
-    except Exception as exc:
-        result["databricks_local"] = {"healthy": False, "message": str(exc)}
+        result["azure_storage"] = {"healthy": False, "message": str(exc)}
     try:
         with socket.create_connection((settings.wms_host, settings.wms_port), timeout=5):
             result["wms_sftp"] = {"healthy": True}
@@ -69,35 +61,6 @@ def cmd_health(_: argparse.Namespace) -> None:
     emit(result)
     if not result["all_healthy"]:
         raise SystemExit(1)
-
-
-def cmd_databricks_run(args: argparse.Namespace) -> None:
-    trading_date = parsed_date(args.date)
-    response = httpx.post(
-        "http://databricks-local:8000/api/2.1/jobs/run-now",
-        json={
-            "job_id": args.job_id,
-            "job_parameters": {"trading_date": trading_date.isoformat()},
-            "idempotency_token": f"{args.job_id}-{trading_date}-{time.time_ns()}",
-        },
-        timeout=10,
-    )
-    response.raise_for_status()
-    run_id = response.json()["run_id"]
-    while True:
-        run_response = httpx.get(
-            "http://databricks-local:8000/api/2.1/jobs/runs/get",
-            params={"run_id": run_id},
-            timeout=10,
-        )
-        run_response.raise_for_status()
-        run = run_response.json()
-        if run["state"]["life_cycle_state"] == "TERMINATED":
-            emit(run)
-            if run["state"].get("result_state") != "SUCCESS":
-                raise SystemExit(1)
-            return
-        time.sleep(1)
 
 
 def cmd_gate_eod(args: argparse.Namespace) -> None:
@@ -146,17 +109,15 @@ def add_date(parser: argparse.ArgumentParser) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Retail DataOps demo operator CLI")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("init-blob")
     sub.add_parser("health")
 
     seed_parser = sub.add_parser("seed")
+    add_date(seed_parser)
     seed_parser.add_argument("--history-days", type=int, default=28)
 
     simulate_parser = sub.add_parser("simulate")
     add_date(simulate_parser)
     simulate_parser.add_argument("--withhold", type=int)
-    simulate_parser.add_argument("--wait-ingest", action="store_true")
 
     release_parser = sub.add_parser("release-eod")
     add_date(release_parser)
@@ -166,19 +127,10 @@ def main() -> None:
     asn_parser.add_argument("--lines", type=int, default=5000)
     asn_parser.add_argument("--force", action="store_true")
 
-    for name in ("bronze", "silver", "replen", "deliver"):
-        item = sub.add_parser(name)
-        add_date(item)
-
-    dbx = sub.add_parser("databricks-run")
-    dbx.add_argument("job_id", type=int, choices=[440, 441, 447])
-    add_date(dbx)
-
-    azure_export = sub.add_parser("export-databricks-silver")
-    add_date(azure_export)
-
-    azure_order = sub.add_parser("import-databricks-order")
-    add_date(azure_order)
+    stage_parser = sub.add_parser("stage-inputs")
+    add_date(stage_parser)
+    deliver_parser = sub.add_parser("deliver")
+    add_date(deliver_parser)
 
     for name in ("gate-eod", "gate-asn", "gate-ack"):
         gate = sub.add_parser(name)
@@ -210,39 +162,26 @@ def main() -> None:
     wms_mode.add_argument("--delay", type=int)
 
     args = parser.parse_args()
-    if args.command == "init-blob":
-        blob.init_container()
-        emit({"container": settings.azure_container, "status": "READY"})
-    elif args.command == "health":
+    if args.command == "health":
         cmd_health(args)
     elif args.command == "seed":
-        emit({"reference": seed_reference(), "history_rows": seed_history(args.history_days)})
-    elif args.command == "simulate":
         trading_date = parsed_date(args.date)
-        result = simulate_day(trading_date, args.withhold)
-        if args.wait_ingest:
-            result["ingress_transactions"] = wait_for_ingest(
-                trading_date, result["transactions"]
-            )
-        emit(result)
+        emit(
+            {
+                "reference": seed_reference(trading_date),
+                "history_rows": seed_history(args.history_days, trading_date),
+            }
+        )
+    elif args.command == "simulate":
+        emit(simulate_day(parsed_date(args.date), args.withhold))
     elif args.command == "release-eod":
         emit(release_eod(parsed_date(args.date)))
     elif args.command == "generate-asn":
         emit(generate_asn(parsed_date(args.date), args.lines, args.force))
-    elif args.command == "bronze":
-        emit(bronze_ingest(parsed_date(args.date)))
-    elif args.command == "silver":
-        emit(silver_conform(parsed_date(args.date)))
-    elif args.command == "replen":
-        emit(replenishment_calc(parsed_date(args.date)))
+    elif args.command == "stage-inputs":
+        emit(stage_inputs(parsed_date(args.date)))
     elif args.command == "deliver":
         emit(deliver_to_wms(parsed_date(args.date)))
-    elif args.command == "databricks-run":
-        cmd_databricks_run(args)
-    elif args.command == "export-databricks-silver":
-        emit(export_silver(parsed_date(args.date)))
-    elif args.command == "import-databricks-order":
-        emit(import_databricks_order(parsed_date(args.date)))
     elif args.command == "gate-eod":
         cmd_gate_eod(args)
     elif args.command == "gate-asn":
