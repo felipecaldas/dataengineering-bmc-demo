@@ -8,7 +8,7 @@ with history as (
     product_sku,
     units_sold,
     sales_ex_gst
-  from {{ source('silver', 'sales_history') }}
+  from {{ source('bronze', 'sales_history') }}
   where sale_date >= {{ retail_dateadd_days(trading_date_sql, -28) }}
     and sale_date < cast('{{ var("trading_date") }}' as date)
 ),

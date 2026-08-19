@@ -10,5 +10,4 @@ select
   review_period_days,
   safety_stock_units,
   is_active_line
-from {{ source('silver', 'product_master') }}
-
+from {{ source('bronze', 'product_master') }}

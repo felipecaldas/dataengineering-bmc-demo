@@ -7,5 +7,5 @@ select
   total_ex_gst,
   eod_ts_local,
   eod_ts_utc
-from {{ source('silver', 'store_eod') }}
+from {{ source('bronze', 'store_eod') }}
 where trading_date = cast('{{ var("trading_date") }}' as date)
