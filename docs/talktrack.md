@@ -14,6 +14,27 @@ Use trading date `2026-08-14` throughout. The retailer, store estate, thresholds
 calendar, volumes and SLA are fictional demo assumptions. Do not describe them as
 Kmart production facts.
 
+## Numbered command sequence
+
+The Makefile wraps each multi-command block in this talk track. Supply another
+valid trading date with `DATE=YYYY-MM-DD` whenever required.
+
+| Command | Purpose |
+|---|---|
+| `make step0` | One-time interactive authentication and external provisioning |
+| `make step1 DATE=...` | Full Airflow rehearsal and cloud warm-up |
+| `make step2 DATE=...` | Prepare the live Airflow source state |
+| `make step3 DATE=...` | Trigger Airflow and publish the live inputs |
+| `make step4 DATE=...` | Prepare and order the delayed-ACK Control-M run |
+| `make simulate DATE=...` | Release the Control-M inputs at the presenter cue |
+| `make step5 DATE=...` | Restore green state, health-check and stop Compose |
+| `make step6 DATE=... ROWS=400` | Start and run the negative-stock failure demo |
+| `make step7 DATE=...` | Recover the failure and restore normal WMS ACK |
+
+The granular Make targets remain available for troubleshooting. The wrappers
+stop at the same presenter-controlled boundaries as the original commands; in
+particular, `step4` orders Control-M but does not publish its inputs.
+
 ## Presenter notation
 
 - **Say** is suggested wording. It is deliberately conversational; do not read it
@@ -39,24 +60,20 @@ These steps are outside the 23-minute presentation.
 Run these only when the environment, notebooks, dbt project or Control-M workflow
 has changed. They create or update external resources.
 
+The ignored `.env` must already contain the Azure, Databricks and dbt Cloud
+values described in `docs/OPERATIONS.md`. On a first checkout, run `make prepare`,
+populate `.env`, and then use the wrapper; rerunning `prepare` inside `step0` is
+harmless.
+
 ```bash
-make prepare
-make install-databricks-cli
-databricks auth login \
-  --host https://WORKSPACE.azuredatabricks.net \
-  --profile retail-demo-azure
-make databricks-provision
-make dbt-cloud-publish
-make dbt-cloud-provision
-make controlm-dbt-trust
-make controlm-dbt-provision
-make controlm-build
-make controlm-deploy
+make step0
 ```
 
-`make databricks-provision`, `make dbt-cloud-provision` and
-`make controlm-deploy` change external systems. Do not run them casually during
-the presentation.
+`step0` pauses for the configured Databricks browser login. It then creates or
+updates Azure Databricks, publishes the dbt deployment branch, creates or updates
+dbt Cloud resources, configures the Control-M dbt integration, validates the
+workflow and deploys it. These are external changes; do not run `step0` casually
+during the presentation.
 
 ### Demo-day preflight
 
@@ -65,22 +82,14 @@ cluster warm, and proves that the Airflow path completes before the Control-M pa
 is ordered for the same date.
 
 ```bash
-make up
-make health
-make controlm-health
-make wms-ack
-make reset DATE=2026-08-14
-make demo-airflow DATE=2026-08-14
+make step1 DATE=2026-08-14
 ```
 
 Confirm that the rehearsal Airflow DAG is complete, then prepare the source state
 for the live Airflow run:
 
 ```bash
-make reset DATE=2026-08-14
-make seed DATE=2026-08-14
-make eod-readiness-arm DATE=2026-08-14
-make health
+make step2 DATE=2026-08-14
 ```
 
 Do not start the timed presentation unless both health commands pass and the
@@ -113,12 +122,11 @@ explained.
 **Do — terminal**
 
 ```bash
-make run-airflow DATE=2026-08-14
-make simulate DATE=2026-08-14
+make step3 DATE=2026-08-14
 ```
 
-Run the commands in this order. Airflow begins by waiting; `simulate` then
-publishes 65,000 POS events, 325 store-EOD markers and the supplier ASN.
+The wrapper triggers Airflow first. Airflow begins by waiting; it then publishes
+65,000 POS events, 325 store-EOD markers and the supplier ASN.
 
 **Show**
 
@@ -307,15 +315,12 @@ integrity for the stopwatch.
 **Do — terminal, after Airflow is complete**
 
 ```bash
-make reset DATE=2026-08-14
-make seed DATE=2026-08-14
-make eod-readiness-arm DATE=2026-08-14
-make wms-late
-make run-controlm DATE=2026-08-14
+make step4 DATE=2026-08-14
 ```
 
-`make wms-late` adds at least a 30-second acknowledgement delay. Delivery still
-succeeds, but the ACK File Watcher remains visible long enough to explain.
+`step4` adds at least a 30-second acknowledgement delay. Delivery still succeeds,
+but the ACK File Watcher remains visible long enough to explain. It deliberately
+does not run `simulate`; that remains the presenter-controlled release at 09:15.
 
 **Do — Control-M UI**
 
@@ -563,19 +568,13 @@ matches the currently active Control-M job:
 Restore normal WMS behavior and green source state:
 
 ```bash
-make wms-ack
-make reset DATE=2026-08-14
-make health
+make step5 DATE=2026-08-14
 ```
 
-When the environment is no longer needed:
-
-```bash
-make down
-```
-
-`make down` retains named-volume state. Do not use `make clean` unless deleting
-all local Redpanda, WMS and Airflow state is intentional.
+`step5` restores normal acknowledgement behavior, resets the date, health-checks
+the green environment and runs `make down`. Named-volume state is retained. Do
+not use `make clean` unless deleting all local Redpanda, WMS and Airflow state is
+intentional.
 
 ## Optional Control-M failure extension
 
@@ -588,13 +587,11 @@ transport success does not imply trustworthy output.
 Make sure no Airflow or Control-M run is active for the date, then run:
 
 ```bash
-make reset DATE=2026-08-14
-make seed DATE=2026-08-14
-make fail-4 ROWS=400 DATE=2026-08-14
-make eod-readiness-arm DATE=2026-08-14
-make run-controlm DATE=2026-08-14
-make simulate DATE=2026-08-14
+make step6 DATE=2026-08-14 ROWS=400
 ```
+
+`step6` starts and health-checks the local stack first, so it is safe to run
+after `step5` has stopped Compose.
 
 **Say**
 
@@ -606,8 +603,7 @@ make simulate DATE=2026-08-14
 After the discussion, stop or hold the failed folder and recover:
 
 ```bash
-make reset DATE=2026-08-14
-make wms-ack
+make step7 DATE=2026-08-14
 ```
 
 ## Likely questions and concise answers

@@ -14,6 +14,28 @@
 The standard presentation date is `2026-08-14`. Pass `DATE` explicitly in
 rehearsal and presentation commands.
 
+## Numbered presentation wrappers
+
+The detailed targets in this guide remain the troubleshooting interface. For a
+rehearsed presentation, `docs/talktrack.md` groups them into fail-fast wrappers:
+
+| Command | Action |
+|---|---|
+| `make step0` | Interactive Databricks login plus all external provisioning and Control-M deployment |
+| `make step1 DATE=...` | Start, validate and run the Airflow rehearsal |
+| `make step2 DATE=...` | Reset, seed and arm the live Airflow state |
+| `make step3 DATE=...` | Trigger Airflow and publish its inputs |
+| `make step4 DATE=...` | Reset, seed, arm and order Control-M with delayed WMS ACK |
+| `make simulate DATE=...` | Publish Control-M inputs at the live presenter cue |
+| `make step5 DATE=...` | Recover, health-check and stop the local stack |
+| `make step6 DATE=... ROWS=400` | Start and run the negative-stock failure scenario |
+| `make step7 DATE=...` | Recover the failure scenario |
+
+`step0` is interactive and mutates Azure Databricks, dbt Cloud, the dbt deployment
+branch and the connected Control-M tenant. `step1`, `step3`, `step4` and `step6`
+start or order real workflow runs. Use the numbered targets deliberately, not as
+local lint or inspection commands.
+
 ## Configure secrets
 
 Create the ignored environment file and runtime directories:

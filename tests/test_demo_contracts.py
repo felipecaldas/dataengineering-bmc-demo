@@ -257,6 +257,24 @@ class RetailContractsTest(unittest.TestCase):
         ):
             self.assertIn(target, makefile)
 
+    def test_make_exposes_numbered_talktrack_wrappers(self) -> None:
+        makefile = (ROOT / "Makefile").read_text()
+        for step in range(8):
+            self.assertIn(f"step{step}:", makefile)
+        self.assertIn("databricks-auth:", makefile)
+        self.assertIn(
+            "validate-date run-airflow simulate DATE=$(DATE)",
+            makefile,
+        )
+        self.assertIn(
+            "eod-readiness-arm wms-late run-controlm DATE=$(DATE)",
+            makefile,
+        )
+        self.assertIn(
+            "controlm-health reset seed fail-4 eod-readiness-arm run-controlm simulate",
+            makefile,
+        )
+
     def test_azure_order_export_matches_wms_contract(self) -> None:
         notebook = (
             ROOT / "databricks" / "notebooks" / "04_export_replenishment.py"

@@ -10,18 +10,52 @@ COMPOSE := docker compose
 TOOL := $(COMPOSE) run --rm toolbox
 CONTROL_M_RENDERED := runtime/controlm/trade_close_to_replenishment.json
 
-.PHONY: help prepare up demo-ready down clean ps logs health controlm-health kafka-topics \
+.PHONY: help step0 step1 step2 step3 step4 step5 step6 step7 validate-date \
+	prepare up demo-ready down clean ps logs health controlm-health kafka-topics \
 	eod-readiness-arm eod-readiness-status airflow-stop airflow-start seed simulate \
 	stage-inputs databricks-ingest dbt-stage dbt-intermediate dbt-gold \
 	databricks-export deliver gate-eod gate-asn gate-ack run-airflow \
 	controlm-render controlm-build controlm-deploy run-controlm controlm-dbt-provision \
-	controlm-dbt-trust controlm-service install-databricks-cli databricks-provision \
+	controlm-dbt-trust controlm-service install-databricks-cli databricks-auth databricks-provision \
 	dbt-cloud-connect dbt-cloud-publish dbt-cloud-provision demo-airflow demo-controlm \
 	wms-ack wms-never-ack wms-late wms-reject fail-1 fail-2 fail-3 fail-4 fail-5 \
 	reset seed-sla-history test lint
 
 help: ## Show the operator commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Retail DataOps demo\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+step0: ## Provision/authenticate all external demo services (interactive and mutating)
+	$(MAKE) prepare
+	$(MAKE) install-databricks-cli
+	$(MAKE) databricks-auth
+	$(MAKE) -j1 databricks-provision dbt-cloud-publish dbt-cloud-provision
+	$(MAKE) -j1 controlm-dbt-trust controlm-dbt-provision controlm-build controlm-deploy
+
+step1: ## Rehearse Airflow and pre-warm the cloud path for DATE
+	$(MAKE) -j1 validate-date up health controlm-health wms-ack reset seed eod-readiness-arm run-airflow simulate DATE=$(DATE)
+
+step2: ## Prepare the live Airflow source state for DATE
+	$(MAKE) -j1 validate-date reset seed eod-readiness-arm health DATE=$(DATE)
+
+step3: ## Trigger the live Airflow run and publish inputs for DATE
+	$(MAKE) -j1 validate-date run-airflow simulate DATE=$(DATE)
+
+step4: ## Prepare and order the delayed-ACK Control-M run for DATE
+	$(MAKE) -j1 validate-date reset seed eod-readiness-arm wms-late run-controlm DATE=$(DATE)
+
+step5: ## Restore green state, health-check and stop the local demo for DATE
+	$(MAKE) -j1 validate-date wms-ack reset health down DATE=$(DATE)
+
+step6: ## Start and order the negative-stock Control-M failure demo for DATE
+	$(MAKE) -j1 validate-date up health controlm-health reset seed fail-4 eod-readiness-arm run-controlm simulate DATE=$(DATE) ROWS=$(ROWS)
+
+step7: ## Recover the failure demo and restore normal WMS ACK for DATE
+	$(MAKE) -j1 validate-date reset wms-ack DATE=$(DATE)
+
+validate-date:
+	@parsed_date=$$(date -d "$(DATE)" +%F 2>/dev/null || true); \
+		test "$$parsed_date" = "$(DATE)" \
+		|| { echo "DATE must be a valid YYYY-MM-DD value; received: $(DATE)" >&2; exit 2; }
 
 prepare: ## Create ignored runtime folders and the local .env file
 	@test -f .env || cp .env.example .env
@@ -130,6 +164,9 @@ controlm-service: ## Install/start the host Agent service (requires sudo)
 
 install-databricks-cli: ## Install the pinned Azure Databricks CLI for this user
 	@./scripts/install_databricks_cli.sh
+
+databricks-auth: ## Log in to the configured Azure Databricks workspace
+	@./scripts/databricks_auth.sh
 
 databricks-provision: ## Create/update the Azure cluster and the two shared jobs
 	@python3 databricks/provision_cluster.py

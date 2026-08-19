@@ -51,7 +51,7 @@ demo metadata.
 
 See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), the
 [presentation runsheet](docs/RUNSHEET.md), and the detailed
-[23-minute talk track](talktrack.md).
+[23-minute talk track](docs/talktrack.md).
 
 ## Local and external components
 
@@ -91,6 +91,10 @@ make health
 
 Provisioning creates external/billable resources and is intentionally separate
 from normal runs.
+
+For the rehearsed presentation, `make step0` through `make step7` wrap the command
+groups in the [talk track](docs/talktrack.md). Each date-scoped wrapper accepts
+`DATE=YYYY-MM-DD`; the granular targets below remain available for diagnosis.
 
 Run Airflow:
 

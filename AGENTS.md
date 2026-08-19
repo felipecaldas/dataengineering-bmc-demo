@@ -91,7 +91,7 @@ Important contracts:
 | `docs/ARCHITECTURE.md` | Architecture decision, as-built boundaries and rerun rules |
 | `docs/OPERATIONS.md` | Provisioning, startup, commands and recovery |
 | `docs/RUNSHEET.md` | Canonical comparison/presentation sequence |
-| `talktrack.md` | Timed 23-minute presenter script derived from the focused docs |
+| `docs/talktrack.md` | Timed 23-minute presenter script derived from the focused docs |
 | `docker-compose.yml` | Local simulation/control-plane topology |
 | `Makefile` | Canonical operator command surface |
 | `demo/` | Generators, readiness, landing, gates, WMS and failure logic |
@@ -237,6 +237,10 @@ put it directly in notebook code or job JSON.
   secret.
 - `make dbt-cloud-publish` pushes a deployment branch.
 - `make dbt-cloud-provision` creates/updates dbt Cloud resources.
+- `make step0` wraps authentication, cloud provisioning, dbt publication and
+  Control-M deployment; never use it as a validation shortcut.
+- `make step1`, `make step3`, `make step4` and `make step6` start local and/or
+  external presentation runs. `step4` and `step6` order live Control-M work.
 - `make reset` mutates one date's demo input/output state but is the normal,
   reversible recovery operation.
 
